@@ -1,5 +1,6 @@
 """Holt's linear trend model, fit by minimizing a joint h-step-ahead loss."""
 
+import functools
 import itertools
 
 import jax
@@ -43,6 +44,22 @@ def _joint_loss(params, y, h, loss_fn):
     return loss_fn(forecasts - actuals)
 
 
+@functools.lru_cache(maxsize=None)
+def _compiled_objective_and_grad(h, loss_name):
+    """JIT-compiled (objective, grad) for a given (h, loss), reused across fits.
+
+    y is a traced arg rather than closed over, so jax.jit's own shape-keyed
+    cache is hit whenever a later .fit() call sees a same-length series with
+    the same (h, loss) instead of recompiling from scratch every call.
+    """
+    loss_fn = _LOSSES[loss_name]
+
+    def objective(params, y):
+        return _joint_loss(params, y, h, loss_fn)
+
+    return jax.jit(objective), jax.jit(jax.grad(objective))
+
+
 def _heuristic_init(y):
     k = min(10, len(y))
     trend0, level0 = np.polyfit(np.arange(k), np.asarray(y)[:k], 1)
@@ -80,19 +97,17 @@ class Holt:
                 f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
             )
 
-        loss_fn = _LOSSES[self.loss]
         y_jax = jnp.asarray(y)
-        objective = jax.jit(lambda p: _joint_loss(p, y_jax, self.h, loss_fn))
-        grad = jax.jit(jax.grad(objective))
+        objective, grad = _compiled_objective_and_grad(self.h, self.loss)
         level0_guess, trend0_guess = _heuristic_init(y)
 
         best = None
         for alpha0, beta0 in _start_grid(self.n_starts):
             x0 = np.array([alpha0, beta0, level0_guess, trend0_guess])
             result = minimize(
-                lambda p: float(objective(p)),
+                lambda p: float(objective(p, y_jax)),
                 x0,
-                jac=lambda p: np.asarray(grad(p)),
+                jac=lambda p: np.asarray(grad(p, y_jax)),
                 method="L-BFGS-B",
                 bounds=_PARAM_BOUNDS + [(None, None), (None, None)],
             )
