@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from statsmodels.tsa.holtwinters import Holt as SMHolt
 
-from multi_ets import DampedHolt, Holt
+from multi_ets import DampedHolt, DampedHoltWinters, Holt, HoltWinters
 
 
 def test_predict_returns_h_forecasts():
@@ -148,6 +148,53 @@ def test_damped_beats_undamped_on_trend_that_levels_off():
     err_undamped = np.abs(undamped.predict() - y_future).mean()
     err_damped = np.abs(damped.predict() - y_future).mean()
     assert err_damped < err_undamped
+
+
+def test_holt_winters_predict_returns_h_forecasts():
+    y = np.linspace(0, 10, 20) + np.tile([1.0, -1.0, 2.0, -2.0], 5)
+    forecasts = HoltWinters(h=4, seasonal_period=4, loss="mse").fit(y).predict()
+    assert np.shape(forecasts) == (4,)
+
+
+def test_damped_holt_winters_predict_returns_h_forecasts():
+    y = np.linspace(0, 10, 20) + np.tile([1.0, -1.0, 2.0, -2.0], 5)
+    forecasts = DampedHoltWinters(h=4, seasonal_period=4, loss="mse").fit(y).predict()
+    assert np.shape(forecasts) == (4,)
+
+
+def test_holt_winters_recovers_trend_and_seasonal_pattern():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y_full = 20.0 + 1.5 * t + seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+
+    forecasts = HoltWinters(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y_fit).predict()
+    np.testing.assert_allclose(forecasts, y_future, atol=0.5)
+
+
+def test_holt_winters_too_short_series_raises():
+    y = np.arange(5, dtype=float)
+    with pytest.raises(ValueError, match="too short"):
+        HoltWinters(h=2, seasonal_period=4).fit(y)
+
+
+def test_holt_winters_seasonal_factors_mean_zero_and_rescale_invariant():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y = 20.0 + 1.5 * t + seasonal_true[t % m]
+
+    model = HoltWinters(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y)
+    # params_ layout: alpha, beta, gamma, level0, trend0, s_0..s_{m-1}
+    season = model.params_[5 : 5 + m]
+    np.testing.assert_allclose(season.mean(), 0.0, atol=1e-6)
+
+    forecasts = model.predict()
+    c = 7.3  # arbitrary shift: -c into level0, +c into every seasonal factor
+    model.params_[3] -= c
+    model.params_[5 : 5 + m] += c
+    np.testing.assert_allclose(model.predict(), forecasts, atol=1e-8)
 
 
 def test_attribute_set_after_construction_is_honored_at_fit():
