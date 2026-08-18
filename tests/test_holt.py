@@ -197,6 +197,89 @@ def test_holt_winters_seasonal_factors_mean_zero_and_rescale_invariant():
     np.testing.assert_allclose(model.predict(), forecasts, atol=1e-8)
 
 
+def test_holt_winters_multiplicative_predict_returns_h_forecasts():
+    m, h = 4, 4
+    t = np.arange(20)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y = (20.0 + 1.5 * t) * seasonal_true[t % m]
+    forecasts = (
+        HoltWinters(h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse")
+        .fit(y)
+        .predict()
+    )
+    assert np.shape(forecasts) == (h,)
+
+
+def test_damped_holt_winters_multiplicative_predict_returns_h_forecasts():
+    m, h = 4, 4
+    t = np.arange(20)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y = (20.0 + 1.5 * t) * seasonal_true[t % m]
+    forecasts = (
+        DampedHoltWinters(h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse")
+        .fit(y)
+        .predict()
+    )
+    assert np.shape(forecasts) == (h,)
+
+
+def test_holt_winters_multiplicative_recovers_growing_seasonal_swing():
+    # Seasonal swing is a fixed ratio of the level, so its absolute amplitude
+    # grows as the level grows -- only a multiplicative model tracks this.
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    level = 20.0 + 1.5 * t
+    y_full = level * seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+
+    forecasts = (
+        HoltWinters(h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse", n_starts=8)
+        .fit(y_fit)
+        .predict()
+    )
+    np.testing.assert_allclose(forecasts, y_future, atol=1.0)
+
+
+def test_holt_winters_multiplicative_seasonal_factors_are_positive():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y = (20.0 + 1.5 * t) * seasonal_true[t % m]
+
+    model = HoltWinters(
+        h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse", n_starts=8
+    ).fit(y)
+    season = model.params_[5 : 5 + m]
+    assert np.all(season > 0)
+
+
+def test_holt_winters_multiplicative_seasonal_factors_mean_one_and_rescale_invariant():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y = (20.0 + 1.5 * t) * seasonal_true[t % m]
+
+    model = HoltWinters(
+        h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse", n_starts=8
+    ).fit(y)
+    # params_ layout: alpha, beta, gamma, level0, trend0, s_0..s_{m-1}
+    season = model.params_[5 : 5 + m]
+    np.testing.assert_allclose(season.mean(), 1.0, atol=1e-6)
+
+    forecasts = model.predict()
+    c = 1.7  # arbitrary scale: *c into level0/trend0, /c into every seasonal factor
+    model.params_[3] *= c
+    model.params_[4] *= c
+    model.params_[5 : 5 + m] /= c
+    np.testing.assert_allclose(model.predict(), forecasts, atol=1e-6)
+
+
+def test_holt_winters_unknown_seasonal_type_raises():
+    with pytest.raises(ValueError, match="Unknown seasonal_type"):
+        HoltWinters(h=4, seasonal_period=4, seasonal_type="bogus")
+
+
 def test_attribute_set_after_construction_is_honored_at_fit():
     y = 3.0 + 2.0 * np.arange(30)
     model = Holt(h=5, loss="huber", delta=1.0)

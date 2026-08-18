@@ -83,21 +83,28 @@ def _states(alpha, beta, phi, level0, trend0, y):
     )
 
 
-def _seasonal_states(alpha, beta, phi, gamma, level0, trend0, season0, y, m):
-    """Level/trend/seasonal-buffer at t=0..T via the additive Holt-Winters recursion.
+def _seasonal_states(alpha, beta, phi, gamma, level0, trend0, season0, y, m, multiplicative=False):
+    """Level/trend/seasonal-buffer at t=0..T via the Holt-Winters recursion.
 
     season_buf holds the last m seasonal factors, oldest first; season_buf[0]
     is s_{t-m}, the one the level update needs. phi=1.0 recovers plain
-    (undamped) Holt-Winters, exactly mirroring _states.
+    (undamped) Holt-Winters, exactly mirroring _states. multiplicative=True
+    swaps the additive (y_t - s_old)/(y_t - new_level) terms for ratios
+    (y_t / s_old)/(y_t / new_level); the trend update is unchanged either way.
     """
     season0 = jnp.asarray(season0)
 
     def step(carry, y_t):
         level, trend, season_buf = carry
         s_old = season_buf[0]
-        new_level = alpha * (y_t - s_old) + (1 - alpha) * (level + phi * trend)
-        new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
-        new_season = gamma * (y_t - new_level) + (1 - gamma) * s_old
+        if multiplicative:
+            new_level = alpha * (y_t / s_old) + (1 - alpha) * (level + phi * trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+            new_season = gamma * (y_t / new_level) + (1 - gamma) * s_old
+        else:
+            new_level = alpha * (y_t - s_old) + (1 - alpha) * (level + phi * trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+            new_season = gamma * (y_t - new_level) + (1 - gamma) * s_old
         new_season_buf = jnp.concatenate([season_buf[1:], jnp.reshape(new_season, (1,))])
         return (new_level, new_trend, new_season_buf), (new_level, new_trend, new_season_buf)
 
@@ -118,8 +125,16 @@ _UNPACK_BY_KIND = {"undamped": _UNPACK_UNDAMPED, "damped": _UNPACK_DAMPED}
 # m free initial seasonal factors s_1..s_m.
 _UNPACK_SEASONAL = lambda p, m: (p[0], p[1], 1.0, p[2], p[3], p[4], p[5 : 5 + m])
 _UNPACK_DAMPED_SEASONAL = lambda p, m: (p[0], p[1], p[2], p[3], p[4], p[5], p[6 : 6 + m])
-_UNPACK_SEASONAL_BY_KIND = {"seasonal": _UNPACK_SEASONAL, "damped_seasonal": _UNPACK_DAMPED_SEASONAL}
+# "_mult" kinds share the same flat-params layout/unpack as their additive
+# counterpart; only the recursion and combine-op (see _joint_loss_seasonal) differ.
+_UNPACK_SEASONAL_BY_KIND = {
+    "seasonal": _UNPACK_SEASONAL,
+    "damped_seasonal": _UNPACK_DAMPED_SEASONAL,
+    "seasonal_mult": _UNPACK_SEASONAL,
+    "damped_seasonal_mult": _UNPACK_DAMPED_SEASONAL,
+}
 _SEASONAL_KINDS = frozenset(_UNPACK_SEASONAL_BY_KIND)
+_MULTIPLICATIVE_KINDS = frozenset({"seasonal_mult", "damped_seasonal_mult"})
 
 
 def _forecast_multiplier(phi, h):
@@ -139,10 +154,10 @@ def _joint_loss(params, y, h, loss_fn, unpack):
     return loss_fn(actuals, forecasts)
 
 
-def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m):
+def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative=False):
     alpha, beta, phi, gamma, level0, trend0, season0 = unpack(params, m)
     levels, trends, season_bufs = _seasonal_states(
-        alpha, beta, phi, gamma, level0, trend0, season0, y, m
+        alpha, beta, phi, gamma, level0, trend0, season0, y, m, multiplicative
     )
     n_origins = len(y) - h + 1
     multiplier = _forecast_multiplier(phi, h)
@@ -151,7 +166,7 @@ def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m):
     # seasonal factors known as of that origin: s_{t+k} == buf_t[(k-1) % m].
     seasonal_idx = jnp.arange(h) % m
     seasonal_part = season_bufs[:n_origins][:, seasonal_idx]
-    forecasts = trend_part + seasonal_part
+    forecasts = trend_part * seasonal_part if multiplicative else trend_part + seasonal_part
     actuals = jnp.stack([y[t : t + h] for t in range(n_origins)])
     return loss_fn(actuals, forecasts)
 
@@ -161,9 +176,10 @@ def _compile_objective_and_grad(h, loss_key, kind, m=None):
 
     if kind in _SEASONAL_KINDS:
         unpack = _UNPACK_SEASONAL_BY_KIND[kind]
+        multiplicative = kind in _MULTIPLICATIVE_KINDS
 
         def objective(params, y):
-            return _joint_loss_seasonal(params, y, h, loss_fn, unpack, m)
+            return _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative)
     else:
         unpack = _UNPACK_BY_KIND[kind]
 
@@ -251,6 +267,18 @@ def _heuristic_seasonal_init(y, m):
     return float(level0), float(trend0), season0
 
 
+def _heuristic_seasonal_init_multiplicative(y, m):
+    """Same idea as _heuristic_seasonal_init, but ratio-based: season0 is the
+    per-season-of-cycle average of y / trend-line instead of y - trend-line."""
+    k = min(2 * m, len(y))
+    idx = np.arange(k)
+    y_k = np.asarray(y)[:k]
+    trend0, level0 = np.polyfit(idx, y_k, 1)
+    ratios = y_k / (level0 + trend0 * idx)
+    season0 = np.array([ratios[idx % m == s].mean() for s in range(m)])
+    return float(level0), float(trend0), np.maximum(season0, _BOUND_EPS)
+
+
 def _start_grid(n_starts, n_dims=2):
     """n_starts points spanning the full n_dims-cube grid, extremes included."""
     side = int(np.ceil(n_starts ** (1 / n_dims)))
@@ -332,9 +360,10 @@ class DampedHolt(Holt):
 
 
 class HoltWinters(Holt):
-    """Holt-Winters: Holt's linear trend plus additive seasonality.
+    """Holt-Winters: Holt's linear trend plus additive or multiplicative seasonality.
 
-    Seasonal factors s_1..s_m (the initial cycle) are free parameters,
+    Seasonal factors s_1..s_m (the initial cycle) are free parameters
+    (box-constrained to stay positive when seasonal_type="multiplicative"),
     jointly optimized alongside alpha/beta/gamma/level0/trend0 against the
     same joint h-step loss as Holt. phi is fixed at 1.0 (undamped trend).
     """
@@ -342,13 +371,31 @@ class HoltWinters(Holt):
     _kind = "seasonal"
     _n_trend_params = 3  # alpha, beta, gamma
 
-    def __init__(self, h, seasonal_period, loss="mse", n_starts=10, delta=1.0, tau=0.5):
+    def __init__(
+        self,
+        h,
+        seasonal_period,
+        seasonal_type="additive",
+        loss="mse",
+        n_starts=10,
+        delta=1.0,
+        tau=0.5,
+    ):
         super().__init__(h, loss=loss, n_starts=n_starts, delta=delta, tau=tau)
+        if seasonal_type not in ("additive", "multiplicative"):
+            raise ValueError(
+                f"Unknown seasonal_type {seasonal_type!r}; "
+                "supported: 'additive', 'multiplicative'"
+            )
         self.seasonal_period = seasonal_period
+        self.seasonal_type = seasonal_type
+        if seasonal_type == "multiplicative":
+            self._kind = self._kind + "_mult"
 
     def fit(self, y):
         y = np.asarray(y, dtype=float)
         m = self.seasonal_period
+        multiplicative = self.seasonal_type == "multiplicative"
         if len(y) < self.h + 1:
             raise ValueError(
                 f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
@@ -362,10 +409,19 @@ class HoltWinters(Holt):
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         y_jax = jnp.asarray(y)
         objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind, m)
-        level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init(y, m)
-        bounds = [(_BOUND_EPS, 1 - _BOUND_EPS)] * self._n_trend_params + [
-            (None, None)
-        ] * (2 + m)
+        if multiplicative:
+            level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
+                y, m
+            )
+            season_bounds = [(_BOUND_EPS, None)] * m
+        else:
+            level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init(y, m)
+            season_bounds = [(None, None)] * m
+        bounds = (
+            [(_BOUND_EPS, 1 - _BOUND_EPS)] * self._n_trend_params
+            + [(None, None), (None, None)]
+            + season_bounds
+        )
 
         best = None
         for start in _start_grid(self.n_starts, self._n_trend_params):
@@ -386,35 +442,53 @@ class HoltWinters(Holt):
         return self
 
     def _rescale_seasonal(self):
-        """Shift seasonal factors to mean 0, folding the removed mean into
-        level0. Both updates are convex combinations of (y_t - s) and
-        (level + s), so a uniform +c/-c shift cancels through the whole
-        recursion and leaves every forecast unchanged."""
+        """Additive: shift seasonal factors to mean 0, folding the removed
+        mean into level0. Both updates are convex combinations of (y_t - s)
+        and (level + s), so a uniform +c/-c shift cancels through the whole
+        recursion and leaves every forecast unchanged.
+
+        Multiplicative: scale seasonal factors to mean 1, folding the removed
+        scale into level0 and trend0. Scaling season by 1/c and (level, trend)
+        by c leaves every one of level_t, trend_t, season_t scaled by the same
+        c (by induction: level_t = alpha*(y_t/s_old) + (1-alpha)*(level+phi*trend)
+        scales by c when s_old scales by 1/c and (level, trend) scale by c;
+        trend_t is a difference of levels so it scales by c too; season_t =
+        gamma*(y_t/level_t) + (1-gamma)*s_old scales by 1/c by the same
+        argument). Forecasts are (level + multiplier*trend) * seasonal, i.e.
+        c * (1/c) = 1, so they're unchanged.
+        """
         m = self.seasonal_period
         n = self._n_trend_params
         season0 = self.params_[n + 2 : n + 2 + m]
         c = season0.mean()
-        self.params_[n] += c
-        self.params_[n + 2 : n + 2 + m] -= c
+        if self.seasonal_type == "multiplicative":
+            self.params_[n] *= c
+            self.params_[n + 1] *= c
+            self.params_[n + 2 : n + 2 + m] /= c
+        else:
+            self.params_[n] += c
+            self.params_[n + 2 : n + 2 + m] -= c
 
     def predict(self):
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
         m = self.seasonal_period
+        multiplicative = self.seasonal_type == "multiplicative"
         alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
             self._kind
         ](self.params_, m)
         levels, trends, season_bufs = _seasonal_states(
-            alpha, beta, phi, gamma, level0, trend0, season0, self._y, m
+            alpha, beta, phi, gamma, level0, trend0, season0, self._y, m, multiplicative
         )
         level, trend = float(levels[-1]), float(trends[-1])
         multiplier = np.asarray(_forecast_multiplier(phi, self.h))
         seasonal = np.asarray(season_bufs[-1])[np.arange(self.h) % m]
-        return level + multiplier * trend + seasonal
+        trend_part = level + multiplier * trend
+        return trend_part * seasonal if multiplicative else trend_part + seasonal
 
 
 class DampedHoltWinters(HoltWinters):
-    """Holt-Winters with additive seasonality and a damped trend."""
+    """Holt-Winters with additive or multiplicative seasonality and a damped trend."""
 
     _kind = "damped_seasonal"
     _n_trend_params = 4  # alpha, beta, phi, gamma
