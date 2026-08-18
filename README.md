@@ -1,0 +1,64 @@
+# multi-ets
+
+Exponential smoothing (Holt, Holt-Winters) fit by minimizing a **joint multi-step-ahead loss**, instead of the classical one-step-ahead loss statsmodels and most other implementations use.
+
+Most ETS implementations fit `alpha`/`beta`/`gamma`/... to minimize one-step-ahead residuals, then hope the recursion also forecasts well `h` steps out. Here, the loss is computed jointly across every valid forecast origin and every horizon step `1..h`, so the fitted parameters are the ones that actually minimize the error you care about: the multi-step forecast.
+
+Built on [JAX](https://github.com/jax-ml/jax) for autodiff + `jit`, with multi-start [L-BFGS-B](https://github.com/google/jaxopt) to deal with the resulting loss surface's local optima.
+
+## Install
+
+```bash
+uv add multi-ets   # or: pip install multi-ets
+```
+
+## Usage
+
+```python
+from multi_ets import Holt, DampedHolt, HoltWinters, DampedHoltWinters
+
+# Plain linear trend, forecast 5 steps ahead.
+forecasts = Holt(h=5).fit(y).predict()
+
+# Damped trend (phi jointly optimized, box-constrained to (0, 1)).
+forecasts = DampedHolt(h=5).fit(y).predict()
+
+# Additive seasonality, period 12 (e.g. monthly data).
+forecasts = HoltWinters(h=5, seasonal_period=12).fit(y).predict()
+
+# Multiplicative seasonality, with a damped trend.
+forecasts = DampedHoltWinters(
+    h=5, seasonal_period=12, seasonal_type="multiplicative"
+).fit(y).predict()
+```
+
+Every model exposes just `.fit(y)` / `.predict()`. Fitted parameters are in `.params_` after `fit()`.
+
+### Loss
+
+All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+ `tau`), or any callable `(y_true, y_pred) -> scalar` written in `jax.numpy`.
+
+```python
+Holt(h=5, loss="huber", delta=2.0).fit(y).predict()
+Holt(h=5, loss=lambda yt, yp: (yt - yp).var()).fit(y).predict()
+```
+
+### Multi-start
+
+Fitting is non-convex, so each model restarts from `n_starts` (default 10) points spread across the parameter box and keeps the best. All restarts for `Holt`/`DampedHolt` run as a single `jax.vmap`'d batched solve rather than a Python loop.
+
+## Model overview
+
+| Class | Trend | Seasonality |
+|---|---|---|
+| `Holt` | linear | — |
+| `DampedHolt` | damped (`phi` fit jointly) | — |
+| `HoltWinters` | linear | additive or multiplicative (`seasonal_type`) |
+| `DampedHoltWinters` | damped | additive or multiplicative |
+
+## Development
+
+```bash
+uv run pytest tests/ -q
+uv run python examples/benchmark.py   # accuracy/speed vs. statsmodels on real datasets
+```
