@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from statsmodels.tsa.holtwinters import Holt as SMHolt
 
-from multi_ets import Holt
+from multi_ets import DampedHolt, Holt
 
 
 def test_predict_returns_h_forecasts():
@@ -120,6 +120,34 @@ def test_non_positive_huber_delta_raises():
 def test_out_of_range_pinball_tau_raises():
     with pytest.raises(ValueError, match="tau must be in"):
         Holt(h=3, loss="pinball", tau=1.5)
+
+
+def test_damped_predict_returns_h_forecasts():
+    y = np.linspace(0, 10, 20)
+    forecasts = DampedHolt(h=4, loss="mse").fit(y).predict()
+    assert np.shape(forecasts) == (4,)
+
+
+def test_damped_phi_stays_in_open_unit_interval():
+    y = np.linspace(0, 10, 20)
+    model = DampedHolt(h=4, loss="mse").fit(y)
+    phi = model.params_[2]
+    assert 0 < phi < 1
+
+
+def test_damped_beats_undamped_on_trend_that_levels_off():
+    h = 4
+    t = np.arange(1, 31)
+    true_phi = 0.6
+    y_full = 10.0 + 8.0 * np.cumsum(true_phi**t)  # trend decaying to a flat asymptote
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+
+    undamped = Holt(h=h, loss="mse", n_starts=10).fit(y_fit)
+    damped = DampedHolt(h=h, loss="mse", n_starts=10).fit(y_fit)
+
+    err_undamped = np.abs(undamped.predict() - y_future).mean()
+    err_damped = np.abs(damped.predict() - y_future).mean()
+    assert err_damped < err_undamped
 
 
 def test_attribute_set_after_construction_is_honored_at_fit():
