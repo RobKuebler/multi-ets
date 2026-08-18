@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import jaxopt
 import numpy as np
+from scipy.optimize import minimize
 
 jax.config.update("jax_enable_x64", True)
 
