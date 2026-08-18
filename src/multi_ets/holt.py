@@ -13,9 +13,48 @@ jax.config.update("jax_enable_x64", True)
 _BOUND_EPS = 1e-4
 _PARAM_BOUNDS = [(_BOUND_EPS, 1 - _BOUND_EPS)] * 2  # alpha, beta
 
-_LOSSES = {
-    "mse": lambda err: jnp.mean(err**2),
+
+def _huber(residual, delta):
+    abs_r = jnp.abs(residual)
+    quadratic = jnp.minimum(abs_r, delta)
+    linear = abs_r - quadratic
+    return jnp.mean(0.5 * quadratic**2 + delta * linear)
+
+
+def _pinball(y_true, y_pred, tau):
+    e = y_true - y_pred
+    return jnp.mean(jnp.maximum(tau * e, (tau - 1) * e))
+
+
+_LOSS_BUILDERS = {
+    "mse": lambda delta, tau: (lambda yt, yp: jnp.mean((yp - yt) ** 2)),
+    "mae": lambda delta, tau: (lambda yt, yp: jnp.mean(jnp.abs(yp - yt))),
+    "huber": lambda delta, tau: (lambda yt, yp: _huber(yp - yt, delta)),
+    "pinball": lambda delta, tau: (lambda yt, yp: _pinball(yt, yp, tau)),
 }
+
+
+def _loss_key(loss, delta, tau):
+    """Hashable identity for a loss choice, used as the compile-cache key."""
+    if callable(loss):
+        return loss
+    if loss not in _LOSS_BUILDERS:
+        raise ValueError(
+            f"Unknown loss {loss!r}; supported: {list(_LOSS_BUILDERS)}, or a callable"
+        )
+    if loss == "huber" and delta <= 0:
+        raise ValueError(f"huber delta must be positive, got {delta}")
+    if loss == "pinball" and not 0 < tau < 1:
+        raise ValueError(f"pinball tau must be in (0, 1), got {tau}")
+    return (loss, delta, tau)
+
+
+def _loss_fn_from_key(key):
+    """(y_true, y_pred) -> scalar, rebuilt from a _loss_key() result."""
+    if callable(key):
+        return key
+    name, delta, tau = key
+    return _LOSS_BUILDERS[name](delta, tau)
 
 
 def _states(alpha, beta, level0, trend0, y):
@@ -41,23 +80,37 @@ def _joint_loss(params, y, h, loss_fn):
     # forecasts[t, k] = forecast made at origin t for horizon step k+1
     forecasts = levels[:n_origins, None] + steps[None, :] * trends[:n_origins, None]
     actuals = jnp.stack([y[t : t + h] for t in range(n_origins)])
-    return loss_fn(forecasts - actuals)
+    return loss_fn(actuals, forecasts)
 
 
-@functools.lru_cache(maxsize=None)
-def _compiled_objective_and_grad(h, loss_name):
-    """JIT-compiled (objective, grad) for a given (h, loss), reused across fits.
-
-    y is a traced arg rather than closed over, so jax.jit's own shape-keyed
-    cache is hit whenever a later .fit() call sees a same-length series with
-    the same (h, loss) instead of recompiling from scratch every call.
-    """
-    loss_fn = _LOSSES[loss_name]
+def _compile_objective_and_grad(h, loss_key):
+    loss_fn = _loss_fn_from_key(loss_key)
 
     def objective(params, y):
         return _joint_loss(params, y, h, loss_fn)
 
     return jax.jit(objective), jax.jit(jax.grad(objective))
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_objective_and_grad_cached(h, loss_key):
+    return _compile_objective_and_grad(h, loss_key)
+
+
+def _compiled_objective_and_grad(h, loss_key):
+    """JIT-compiled (objective, grad) for a given (h, loss), reused across fits.
+
+    y is a traced arg rather than closed over, so jax.jit's own shape-keyed
+    cache is hit whenever a later .fit() call sees a same-length series with
+    the same (h, loss) instead of recompiling from scratch every call.
+
+    Custom callables bypass the cache: keying on them would pin every
+    distinct callable (and its closed-over data) in this module-level cache
+    for the life of the process.
+    """
+    if callable(loss_key):
+        return _compile_objective_and_grad(h, loss_key)
+    return _compiled_objective_and_grad_cached(h, loss_key)
 
 
 def _heuristic_init(y):
@@ -82,12 +135,13 @@ class Holt:
     every valid origin and every horizon step 1..h.
     """
 
-    def __init__(self, h, loss="mse", n_starts=10):
-        if loss not in _LOSSES:
-            raise ValueError(f"Unknown loss {loss!r}; supported: {list(_LOSSES)}")
+    def __init__(self, h, loss="mse", n_starts=10, delta=1.0, tau=0.5):
+        _loss_key(loss, delta, tau)  # validate eagerly, re-resolved fresh in fit()
         self.h = h
         self.loss = loss
         self.n_starts = n_starts
+        self.delta = delta
+        self.tau = tau
         self.params_ = None
 
     def fit(self, y):
@@ -97,8 +151,9 @@ class Holt:
                 f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
             )
 
+        loss_key = _loss_key(self.loss, self.delta, self.tau)
         y_jax = jnp.asarray(y)
-        objective, grad = _compiled_objective_and_grad(self.h, self.loss)
+        objective, grad = _compiled_objective_and_grad(self.h, loss_key)
         level0_guess, trend0_guess = _heuristic_init(y)
 
         best = None
