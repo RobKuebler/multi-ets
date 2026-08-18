@@ -5,12 +5,20 @@ import itertools
 
 import jax
 import jax.numpy as jnp
+import jaxopt
 import numpy as np
-from scipy.optimize import minimize
 
 jax.config.update("jax_enable_x64", True)
 
 _BOUND_EPS = 1e-4
+# L-BFGS-B stopping criteria for the vmapped multi-start solver below. A low
+# maxiter is deliberate, not just a speed knob: jaxopt's LBFGSB converges
+# more thoroughly per-start than scipy's did, so a generous budget lets any
+# single start fully solve the problem alone and defeats the point of
+# multi-start restarts. Capping iterations keeps restarts meaningfully
+# different, matching scipy's original multi-start behavior.
+_LBFGSB_MAXITER = 20
+_LBFGSB_TOL = 1e-6
 
 
 def _huber(residual, delta):
@@ -127,6 +135,44 @@ def _compiled_objective_and_grad(h, loss_key, kind):
     return _compiled_objective_and_grad_cached(h, loss_key, kind)
 
 
+def _compile_multistart(h, loss_key, kind):
+    """Vmapped L-BFGS-B: runs every restart as one batched solve, not a Python loop.
+
+    Reuses the cached (objective, grad) pair as jaxopt's value_and_grad so the
+    autodiff/compile work is identical to before; only the restart loop moves
+    from sequential scipy calls into a single jax.vmap'd solver.run.
+    """
+    objective, grad = _compile_objective_and_grad(h, loss_key, kind)
+    solver = jaxopt.LBFGSB(
+        fun=lambda p, y: (objective(p, y), grad(p, y)),
+        value_and_grad=True,
+        maxiter=_LBFGSB_MAXITER,
+        tol=_LBFGSB_TOL,
+    )
+
+    def run_all(x0_batch, lower, upper, y):
+        run_one = lambda x0: solver.run(x0, (lower, upper), y)
+        params, state = jax.vmap(run_one)(x0_batch)
+        return params, state.value
+
+    return jax.jit(run_all)
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_multistart_cached(h, loss_key, kind):
+    return _compile_multistart(h, loss_key, kind)
+
+
+def _compiled_multistart(h, loss_key, kind):
+    """JIT-compiled vmapped multi-start solver for (h, loss, kind), reused across fits.
+
+    Mirrors _compiled_objective_and_grad's cache-bypass for custom callables.
+    """
+    if callable(loss_key):
+        return _compile_multistart(h, loss_key, kind)
+    return _compiled_multistart_cached(h, loss_key, kind)
+
+
 def _heuristic_init(y):
     k = min(10, len(y))
     trend0, level0 = np.polyfit(np.arange(k), np.asarray(y)[:k], 1)
@@ -170,27 +216,17 @@ class Holt:
 
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         y_jax = jnp.asarray(y)
-        objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind)
+        run_all = _compiled_multistart(self.h, loss_key, self._kind)
         level0_guess, trend0_guess = _heuristic_init(y)
-        bounds = [(_BOUND_EPS, 1 - _BOUND_EPS)] * self._n_trend_params + [
-            (None, None),
-            (None, None),
-        ]
 
-        best = None
-        for start in _start_grid(self.n_starts, self._n_trend_params):
-            x0 = np.array([*start, level0_guess, trend0_guess])
-            result = minimize(
-                lambda p: float(objective(p, y_jax)),
-                x0,
-                jac=lambda p: np.asarray(grad(p, y_jax)),
-                method="L-BFGS-B",
-                bounds=bounds,
-            )
-            if best is None or result.fun < best.fun:
-                best = result
+        starts = np.array(_start_grid(self.n_starts, self._n_trend_params))
+        tail = np.tile([level0_guess, trend0_guess], (len(starts), 1))
+        x0_batch = jnp.asarray(np.concatenate([starts, tail], axis=1))
+        lower = jnp.array([_BOUND_EPS] * self._n_trend_params + [-jnp.inf, -jnp.inf])
+        upper = jnp.array([1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf, jnp.inf])
 
-        self.params_ = best.x
+        params_batch, values = run_all(x0_batch, lower, upper, y_jax)
+        self.params_ = np.asarray(params_batch[jnp.argmin(values)])
         self._y = y
         return self
 
