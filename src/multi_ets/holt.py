@@ -2,6 +2,8 @@
 
 import functools
 import itertools
+from collections.abc import Callable
+from typing import Any, Self
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +13,11 @@ from scipy.optimize import minimize
 from scipy.stats import norm
 
 jax.config.update("jax_enable_x64", True)
+
+# Arrays flow through this module as a duck-typed mix of Python scalars, numpy
+# arrays, and jax arrays (jnp.asarray()'d at the boundaries); `Any` reflects
+# that rather than pretending to a precision the code doesn't have.
+Array = jax.Array
 
 _BOUND_EPS = 1e-4
 # L-BFGS-B stopping criteria for the vmapped multi-start solver below. A low
@@ -23,34 +30,32 @@ _LBFGSB_MAXITER = 20
 _LBFGSB_TOL = 1e-6
 
 
-def _huber(residual, delta):
+def _huber(residual: Any, delta: float) -> Array:
     abs_r = jnp.abs(residual)
     quadratic = jnp.minimum(abs_r, delta)
     linear = abs_r - quadratic
     return jnp.mean(0.5 * quadratic**2 + delta * linear)
 
 
-def _pinball(y_true, y_pred, tau):
+def _pinball(y_true: Any, y_pred: Any, tau: float) -> Array:
     e = y_true - y_pred
     return jnp.mean(jnp.maximum(tau * e, (tau - 1) * e))
 
 
 _LOSS_BUILDERS = {
-    "mse": lambda delta, tau: (lambda yt, yp: jnp.mean((yp - yt) ** 2)),
-    "mae": lambda delta, tau: (lambda yt, yp: jnp.mean(jnp.abs(yp - yt))),
-    "huber": lambda delta, tau: (lambda yt, yp: _huber(yp - yt, delta)),
-    "pinball": lambda delta, tau: (lambda yt, yp: _pinball(yt, yp, tau)),
+    "mse": lambda delta, tau: lambda yt, yp: jnp.mean((yp - yt) ** 2),
+    "mae": lambda delta, tau: lambda yt, yp: jnp.mean(jnp.abs(yp - yt)),
+    "huber": lambda delta, tau: lambda yt, yp: _huber(yp - yt, delta),
+    "pinball": lambda delta, tau: lambda yt, yp: _pinball(yt, yp, tau),
 }
 
 
-def _loss_key(loss, delta, tau):
+def _loss_key(loss: str | Callable[..., Any], delta: float, tau: float) -> Any:
     """Hashable identity for a loss choice, used as the compile-cache key."""
     if callable(loss):
         return loss
     if loss not in _LOSS_BUILDERS:
-        raise ValueError(
-            f"Unknown loss {loss!r}; supported: {list(_LOSS_BUILDERS)}, or a callable"
-        )
+        raise ValueError(f"Unknown loss {loss!r}; supported: {list(_LOSS_BUILDERS)}, or a callable")
     if loss == "huber" and delta <= 0:
         raise ValueError(f"huber delta must be positive, got {delta}")
     if loss == "pinball" and not 0 < tau < 1:
@@ -58,7 +63,7 @@ def _loss_key(loss, delta, tau):
     return (loss, delta, tau)
 
 
-def _loss_fn_from_key(key):
+def _loss_fn_from_key(key: Any) -> Callable[[Any, Any], Any]:
     """(y_true, y_pred) -> scalar, rebuilt from a _loss_key() result."""
     if callable(key):
         return key
@@ -66,13 +71,15 @@ def _loss_fn_from_key(key):
     return _LOSS_BUILDERS[name](delta, tau)
 
 
-def _states(alpha, beta, phi, level0, trend0, y):
+def _states(
+    alpha: Any, beta: Any, phi: Any, level0: Any, trend0: Any, y: Any
+) -> tuple[Array, Array]:
     """Level/trend at t=0..T via the (damped) Holt recursion; states[0] is (level0, trend0).
 
     phi=1.0 recovers plain Holt exactly.
     """
 
-    def step(carry, y_t):
+    def step(carry: Any, y_t: Any) -> Any:
         level, trend = carry
         new_level = alpha * y_t + (1 - alpha) * (level + phi * trend)
         new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
@@ -84,7 +91,18 @@ def _states(alpha, beta, phi, level0, trend0, y):
     )
 
 
-def _seasonal_states(alpha, beta, phi, gamma, level0, trend0, season0, y, m, multiplicative=False):
+def _seasonal_states(
+    alpha: Any,
+    beta: Any,
+    phi: Any,
+    gamma: Any,
+    level0: Any,
+    trend0: Any,
+    season0: Any,
+    y: Any,
+    m: int,
+    multiplicative: bool = False,
+) -> tuple[Array, Array, Array]:
     """Level/trend/seasonal-buffer at t=0..T via the Holt-Winters recursion.
 
     season_buf holds the last m seasonal factors, oldest first; season_buf[0]
@@ -95,7 +113,7 @@ def _seasonal_states(alpha, beta, phi, gamma, level0, trend0, season0, y, m, mul
     """
     season0 = jnp.asarray(season0)
 
-    def step(carry, y_t):
+    def step(carry: Any, y_t: Any) -> Any:
         level, trend, season_buf = carry
         s_old = season_buf[0]
         if multiplicative:
@@ -117,16 +135,32 @@ def _seasonal_states(alpha, beta, phi, gamma, level0, trend0, season0, y, m, mul
     )
 
 
-_UNPACK_UNDAMPED = lambda p: (p[0], p[1], 1.0, p[2], p[3])
-_UNPACK_DAMPED = lambda p: (p[0], p[1], p[2], p[3], p[4])
-_UNPACK_SES = lambda p: (p[0], 0.0, 0.0, p[1], 0.0)
+def _UNPACK_UNDAMPED(p: Any) -> tuple[Any, ...]:
+    return (p[0], p[1], 1.0, p[2], p[3])
+
+
+def _UNPACK_DAMPED(p: Any) -> tuple[Any, ...]:
+    return (p[0], p[1], p[2], p[3], p[4])
+
+
+def _UNPACK_SES(p: Any) -> tuple[Any, ...]:
+    return (p[0], 0.0, 0.0, p[1], 0.0)
+
+
 _UNPACK_BY_KIND = {"undamped": _UNPACK_UNDAMPED, "damped": _UNPACK_DAMPED, "ses": _UNPACK_SES}
+
 
 # Seasonal flat-params layout: box-constrained params first (matching
 # _n_trend_params: alpha, beta, [phi,] gamma), then level0, trend0, then the
 # m free initial seasonal factors s_1..s_m.
-_UNPACK_SEASONAL = lambda p, m: (p[0], p[1], 1.0, p[2], p[3], p[4], p[5 : 5 + m])
-_UNPACK_DAMPED_SEASONAL = lambda p, m: (p[0], p[1], p[2], p[3], p[4], p[5], p[6 : 6 + m])
+def _UNPACK_SEASONAL(p: Any, m: int) -> tuple[Any, ...]:
+    return (p[0], p[1], 1.0, p[2], p[3], p[4], p[5 : 5 + m])
+
+
+def _UNPACK_DAMPED_SEASONAL(p: Any, m: int) -> tuple[Any, ...]:
+    return (p[0], p[1], p[2], p[3], p[4], p[5], p[6 : 6 + m])
+
+
 # "_mult" kinds share the same flat-params layout/unpack as their additive
 # counterpart; only the recursion and combine-op (see _joint_loss_seasonal) differ.
 _UNPACK_SEASONAL_BY_KIND = {
@@ -139,13 +173,15 @@ _SEASONAL_KINDS = frozenset(_UNPACK_SEASONAL_BY_KIND)
 _MULTIPLICATIVE_KINDS = frozenset({"seasonal_mult", "damped_seasonal_mult"})
 
 
-def _forecast_multiplier(phi, h):
+def _forecast_multiplier(phi: Any, h: int) -> Array:
     """multiplier[k] = sum_{j=1}^{k+1} phi^j; equals arange(1, h+1) when phi == 1."""
     steps = jnp.arange(1, h + 1)
     return jnp.cumsum(phi**steps)
 
 
-def _forecast_matrix(params, y, h, unpack):
+def _forecast_matrix(
+    params: Any, y: Any, h: int, unpack: Callable[..., Any]
+) -> tuple[Array, Array]:
     """forecasts[t, k] = forecast made at origin t for horizon step k+1, plus actuals[t, k]."""
     alpha, beta, phi, level0, trend0 = unpack(params)
     levels, trends = _states(alpha, beta, phi, level0, trend0, y)
@@ -156,8 +192,15 @@ def _forecast_matrix(params, y, h, unpack):
     return forecasts, actuals
 
 
-def _forecast_matrix_seasonal(params, y, h, unpack, m, multiplicative=False):
-    """Same as _forecast_matrix but for the seasonal recursion."""
+def _forecast_matrix_seasonal(
+    params: Any,
+    y: Any,
+    h: int,
+    unpack: Callable[..., Any],
+    m: int,
+    multiplicative: bool = False,
+) -> tuple[Array, Array]:
+    """Mirror _forecast_matrix, but for the seasonal recursion."""
     alpha, beta, phi, gamma, level0, trend0, season0 = unpack(params, m)
     levels, trends, season_bufs = _seasonal_states(
         alpha, beta, phi, gamma, level0, trend0, season0, y, m, multiplicative
@@ -174,40 +217,57 @@ def _forecast_matrix_seasonal(params, y, h, unpack, m, multiplicative=False):
     return forecasts, actuals
 
 
-def _joint_loss(params, y, h, loss_fn, unpack):
+def _joint_loss(
+    params: Any, y: Any, h: int, loss_fn: Callable[..., Any], unpack: Callable[..., Any]
+) -> Array:
     forecasts, actuals = _forecast_matrix(params, y, h, unpack)
     return loss_fn(actuals, forecasts)
 
 
-def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative=False):
+def _joint_loss_seasonal(
+    params: Any,
+    y: Any,
+    h: int,
+    loss_fn: Callable[..., Any],
+    unpack: Callable[..., Any],
+    m: int,
+    multiplicative: bool = False,
+) -> Array:
     forecasts, actuals = _forecast_matrix_seasonal(params, y, h, unpack, m, multiplicative)
     return loss_fn(actuals, forecasts)
 
 
-def _compile_objective_and_grad(h, loss_key, kind, m=None):
+def _compile_objective_and_grad(
+    h: int, loss_key: Any, kind: str, m: int | None = None
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
     loss_fn = _loss_fn_from_key(loss_key)
 
     if kind in _SEASONAL_KINDS:
+        assert m is not None  # callers always pass seasonal_period for seasonal kinds
         unpack = _UNPACK_SEASONAL_BY_KIND[kind]
         multiplicative = kind in _MULTIPLICATIVE_KINDS
 
-        def objective(params, y):
+        def objective(params: Any, y: Any) -> Array:
             return _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative)
     else:
         unpack = _UNPACK_BY_KIND[kind]
 
-        def objective(params, y):
+        def objective(params: Any, y: Any) -> Array:
             return _joint_loss(params, y, h, loss_fn, unpack)
 
     return jax.jit(objective), jax.jit(jax.grad(objective))
 
 
-@functools.lru_cache(maxsize=None)
-def _compiled_objective_and_grad_cached(h, loss_key, kind, m=None):
+@functools.cache
+def _compiled_objective_and_grad_cached(
+    h: int, loss_key: Any, kind: str, m: int | None = None
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
     return _compile_objective_and_grad(h, loss_key, kind, m)
 
 
-def _compiled_objective_and_grad(h, loss_key, kind, m=None):
+def _compiled_objective_and_grad(
+    h: int, loss_key: Any, kind: str, m: int | None = None
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
     """JIT-compiled (objective, grad) for a given (h, loss, kind, m), reused across fits.
 
     y is a traced arg rather than closed over, so jax.jit's own shape-keyed
@@ -224,7 +284,7 @@ def _compiled_objective_and_grad(h, loss_key, kind, m=None):
     return _compiled_objective_and_grad_cached(h, loss_key, kind, m)
 
 
-def _compile_multistart(h, loss_key, kind):
+def _compile_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     """Vmapped L-BFGS-B: runs every restart as one batched solve, not a Python loop.
 
     Reuses the cached (objective, grad) pair as jaxopt's value_and_grad so the
@@ -239,20 +299,22 @@ def _compile_multistart(h, loss_key, kind):
         tol=_LBFGSB_TOL,
     )
 
-    def run_all(x0_batch, lower, upper, y):
-        run_one = lambda x0: solver.run(x0, (lower, upper), y)
+    def run_all(x0_batch: Any, lower: Any, upper: Any, y: Any) -> tuple[Any, Any]:
+        def run_one(x0: Any) -> Any:
+            return solver.run(x0, (lower, upper), y)
+
         params, state = jax.vmap(run_one)(x0_batch)
         return params, state.value
 
     return jax.jit(run_all)
 
 
-@functools.lru_cache(maxsize=None)
-def _compiled_multistart_cached(h, loss_key, kind):
+@functools.cache
+def _compiled_multistart_cached(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     return _compile_multistart(h, loss_key, kind)
 
 
-def _compiled_multistart(h, loss_key, kind):
+def _compiled_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     """JIT-compiled vmapped multi-start solver for (h, loss, kind), reused across fits.
 
     Mirrors _compiled_objective_and_grad's cache-bypass for custom callables.
@@ -262,15 +324,17 @@ def _compiled_multistart(h, loss_key, kind):
     return _compiled_multistart_cached(h, loss_key, kind)
 
 
-def _heuristic_init(y):
+def _heuristic_init(y: Any) -> tuple[float, float]:
     k = min(10, len(y))
     trend0, level0 = np.polyfit(np.arange(k), np.asarray(y)[:k], 1)
     return float(level0), float(trend0)
 
 
-def _heuristic_seasonal_init(y, m):
-    """level0/trend0 via linear fit on the first ~2 cycles; season0 as the
-    per-season-of-cycle average deviation from that line."""
+def _heuristic_seasonal_init(y: Any, m: int) -> tuple[float, float, np.ndarray]:
+    """Compute level0/trend0 via linear fit on the first ~2 cycles.
+
+    season0 is the per-season-of-cycle average deviation from that line.
+    """
     k = min(2 * m, len(y))
     idx = np.arange(k)
     y_k = np.asarray(y)[:k]
@@ -280,9 +344,12 @@ def _heuristic_seasonal_init(y, m):
     return float(level0), float(trend0), season0
 
 
-def _heuristic_seasonal_init_multiplicative(y, m):
-    """Same idea as _heuristic_seasonal_init, but ratio-based: season0 is the
-    per-season-of-cycle average of y / trend-line instead of y - trend-line."""
+def _heuristic_seasonal_init_multiplicative(y: Any, m: int) -> tuple[float, float, np.ndarray]:
+    """Mirror _heuristic_seasonal_init, but ratio-based.
+
+    season0 is the per-season-of-cycle average of y / trend-line instead of
+    y - trend-line.
+    """
     k = min(2 * m, len(y))
     idx = np.arange(k)
     y_k = np.asarray(y)[:k]
@@ -292,7 +359,7 @@ def _heuristic_seasonal_init_multiplicative(y, m):
     return float(level0), float(trend0), np.maximum(season0, _BOUND_EPS)
 
 
-def _start_grid(n_starts, n_dims=2):
+def _start_grid(n_starts: int, n_dims: int = 2) -> list[tuple[float, ...]]:
     """n_starts points spanning the full n_dims-cube grid, extremes included."""
     side = int(np.ceil(n_starts ** (1 / n_dims)))
     grid = np.linspace(0.05, 0.95, side)
@@ -311,17 +378,26 @@ class Holt:
     _kind = "undamped"
     _n_trend_params = 2  # alpha, beta
     _n_free_params = 2  # level0, trend0
+    seasonal_period: int | None = None  # set by HoltWinters; read here by _resid_std
 
-    def __init__(self, h, loss="mse", n_starts=10, delta=1.0, tau=0.5):
+    def __init__(
+        self,
+        h: int,
+        loss: str | Callable[..., Any] = "mse",
+        n_starts: int = 10,
+        delta: float = 1.0,
+        tau: float = 0.5,
+    ) -> None:
         _loss_key(loss, delta, tau)  # validate eagerly, re-resolved fresh in fit()
         self.h = h
         self.loss = loss
         self.n_starts = n_starts
         self.delta = delta
         self.tau = tau
-        self.params_ = None
+        self.params_: np.ndarray | None = None
 
-    def fit(self, y):
+    def fit(self, y: Any) -> Self:
+        """Fit alpha/beta/level0/trend0 by joint multi-start optimization; returns self."""
         y = np.asarray(y, dtype=float)
         if len(y) < self.h + 1:
             raise ValueError(
@@ -338,16 +414,15 @@ class Holt:
         tail = np.tile(free_guess, (len(starts), 1))
         x0_batch = jnp.asarray(np.concatenate([starts, tail], axis=1))
         lower = jnp.array([_BOUND_EPS] * self._n_trend_params + [-jnp.inf] * self._n_free_params)
-        upper = jnp.array(
-            [1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf] * self._n_free_params
-        )
+        upper = jnp.array([1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf] * self._n_free_params)
 
         params_batch, values = run_all(x0_batch, lower, upper, y_jax)
         self.params_ = np.asarray(params_batch[jnp.argmin(values)])
         self._y = y
         return self
 
-    def predict(self):
+    def predict(self) -> np.ndarray:
+        """Forecast the next self.h steps from the fitted level/trend."""
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
         alpha, beta, level0, trend0 = self.params_
@@ -355,7 +430,7 @@ class Holt:
         level, trend = float(levels[-1]), float(trends[-1])
         return level + np.arange(1, self.h + 1) * trend
 
-    def _resid_std(self):
+    def _resid_std(self) -> np.ndarray:
         """Per-horizon-step std of (actual - forecast) across every valid training origin.
 
         Recomputes the forecast matrix from the fitted params, dispatching
@@ -369,6 +444,7 @@ class Holt:
         """
         y_jax = jnp.asarray(self._y)
         if self._kind in _SEASONAL_KINDS:
+            assert self.seasonal_period is not None  # set by HoltWinters for seasonal kinds
             unpack = _UNPACK_SEASONAL_BY_KIND[self._kind]
             multiplicative = self._kind in _MULTIPLICATIVE_KINDS
             forecasts, actuals = _forecast_matrix_seasonal(
@@ -379,7 +455,9 @@ class Holt:
             forecasts, actuals = _forecast_matrix(self.params_, y_jax, self.h, unpack)
         return np.asarray(jnp.std(actuals - forecasts, axis=0))
 
-    def predict_interval(self, coverage=0.9):
+    def predict_interval(
+        self, coverage: float | list[float] | tuple[float, ...] = 0.9
+    ) -> tuple[np.ndarray, np.ndarray] | dict[float, tuple[np.ndarray, np.ndarray]]:
         """Empirical per-horizon-step Gaussian interval(s) around .predict().
 
         coverage: a single float -> (lower, upper) array pair; a list of
@@ -390,7 +468,7 @@ class Holt:
         point = self.predict()
         std = self._resid_std()
 
-        def bounds(c):
+        def bounds(c: float) -> tuple[np.ndarray, np.ndarray]:
             z = norm.ppf(0.5 + c / 2)
             return point - z * std, point + z * std
 
@@ -411,7 +489,8 @@ class SES(Holt):
     _n_trend_params = 1  # alpha
     _n_free_params = 1  # level0
 
-    def predict(self):
+    def predict(self) -> np.ndarray:
+        """Forecast the next self.h steps as a flat repeat of the fitted level."""
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
         alpha, level0 = self.params_
@@ -429,7 +508,8 @@ class DampedHolt(Holt):
     _kind = "damped"
     _n_trend_params = 3  # alpha, beta, phi
 
-    def predict(self):
+    def predict(self) -> np.ndarray:
+        """Forecast the next self.h steps from the fitted level/trend/damping."""
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
         alpha, beta, phi, level0, trend0 = self.params_
@@ -450,29 +530,30 @@ class HoltWinters(Holt):
 
     _kind = "seasonal"
     _n_trend_params = 3  # alpha, beta, gamma
+    seasonal_period: int  # narrows Holt's int | None: always set by this subclass's __init__
 
     def __init__(
         self,
-        h,
-        seasonal_period,
-        seasonal_type="additive",
-        loss="mse",
-        n_starts=10,
-        delta=1.0,
-        tau=0.5,
-    ):
+        h: int,
+        seasonal_period: int,
+        seasonal_type: str = "additive",
+        loss: str | Callable[..., Any] = "mse",
+        n_starts: int = 10,
+        delta: float = 1.0,
+        tau: float = 0.5,
+    ) -> None:
         super().__init__(h, loss=loss, n_starts=n_starts, delta=delta, tau=tau)
         if seasonal_type not in ("additive", "multiplicative"):
             raise ValueError(
-                f"Unknown seasonal_type {seasonal_type!r}; "
-                "supported: 'additive', 'multiplicative'"
+                f"Unknown seasonal_type {seasonal_type!r}; supported: 'additive', 'multiplicative'"
             )
         self.seasonal_period = seasonal_period
         self.seasonal_type = seasonal_type
         if seasonal_type == "multiplicative":
             self._kind = self._kind + "_mult"
 
-    def fit(self, y):
+    def fit(self, y: Any) -> Self:
+        """Fit trend and seasonal params by joint multi-start optimization; returns self."""
         y = np.asarray(y, dtype=float)
         m = self.seasonal_period
         multiplicative = self.seasonal_type == "multiplicative"
@@ -516,13 +597,16 @@ class HoltWinters(Holt):
             if best is None or result.fun < best.fun:
                 best = result
 
+        assert best is not None  # _start_grid always yields at least one start
         self.params_ = best.x
         self._y = y
         self._rescale_seasonal()
         return self
 
-    def _rescale_seasonal(self):
-        """Additive: shift seasonal factors to mean 0, folding the removed
+    def _rescale_seasonal(self) -> None:
+        """Rescale seasonal factors to a canonical mean, without changing any forecast.
+
+        Additive: shift seasonal factors to mean 0, folding the removed
         mean into level0. Both updates are convex combinations of (y_t - s)
         and (level + s), so a uniform +c/-c shift cancels through the whole
         recursion and leaves every forecast unchanged.
@@ -537,6 +621,7 @@ class HoltWinters(Holt):
         argument). Forecasts are (level + multiplier*trend) * seasonal, i.e.
         c * (1/c) = 1, so they're unchanged.
         """
+        assert self.params_ is not None  # only called from fit(), right after it's set
         m = self.seasonal_period
         n = self._n_trend_params
         season0 = self.params_[n + 2 : n + 2 + m]
@@ -549,14 +634,15 @@ class HoltWinters(Holt):
             self.params_[n] += c
             self.params_[n + 2 : n + 2 + m] -= c
 
-    def predict(self):
+    def predict(self) -> np.ndarray:
+        """Forecast the next self.h steps from the fitted level/trend/seasonal factors."""
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
         m = self.seasonal_period
         multiplicative = self.seasonal_type == "multiplicative"
-        alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
-            self._kind
-        ](self.params_, m)
+        alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[self._kind](
+            self.params_, m
+        )
         levels, trends, season_bufs = _seasonal_states(
             alpha, beta, phi, gamma, level0, trend0, season0, self._y, m, multiplicative
         )

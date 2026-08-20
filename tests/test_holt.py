@@ -23,9 +23,7 @@ def test_matches_statsmodels_classical_holt_at_h1():
     rng = np.random.default_rng(0)
     y = np.cumsum(rng.normal(0.5, 1.0, 50)) + 20
 
-    sm_fit = SMHolt(y, initialization_method="estimated", damped_trend=False).fit(
-        optimized=True
-    )
+    sm_fit = SMHolt(y, initialization_method="estimated", damped_trend=False).fit(optimized=True)
     ours = Holt(h=1, loss="mse").fit(y)
 
     np.testing.assert_allclose(ours.predict(), sm_fit.forecast(1), atol=1e-3)

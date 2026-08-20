@@ -16,10 +16,38 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.6.2",
     "pytest>=8.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.3",
     "statsmodels>=0.14",
+    "ty>=0.0.73",
 ]
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "NPY", "D", "ANN"]
+# ANN401: this module deliberately types jax/numpy duck-typed values as Any
+# rather than chasing precise jax stubs that don't buy much at this size.
+ignore = ["ANN401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "ANN"]
+"examples/*" = ["D", "ANN"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=multi_ets --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/multi_ets"]

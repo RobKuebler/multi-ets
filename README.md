@@ -30,9 +30,9 @@ forecasts = DampedHolt(h=5).fit(y).predict()
 forecasts = HoltWinters(h=5, seasonal_period=12).fit(y).predict()
 
 # Multiplicative seasonality, with a damped trend.
-forecasts = DampedHoltWinters(
-    h=5, seasonal_period=12, seasonal_type="multiplicative"
-).fit(y).predict()
+forecasts = (
+    DampedHoltWinters(h=5, seasonal_period=12, seasonal_type="multiplicative").fit(y).predict()
+)
 ```
 
 Every model exposes just `.fit(y)` / `.predict()`. Fitted parameters are in `.params_` after `fit()`.
@@ -95,4 +95,11 @@ Fitting is non-convex, so each model restarts from `n_starts` (default 10) point
 ```bash
 uv run pytest tests/ -q
 uv run python examples/benchmark.py   # accuracy/speed vs. statsmodels on real datasets
+
+uv run pre-commit install   # once, to run lint/format/type checks on every commit
+uv run pre-commit run --all-files
+
+uv run ruff check .    # lint
+uv run ruff format .   # format
+uv run ty check src    # type check
 ```

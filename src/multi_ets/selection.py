@@ -1,11 +1,16 @@
 """Model selection via rolling-origin cross-validation."""
 
+from collections.abc import Iterable
+from typing import Any
+
 import numpy as np
 
-from multi_ets.holt import _loss_fn_from_key, _loss_key
+from multi_ets.holt import Holt, _loss_fn_from_key, _loss_key
 
 
-def select_model(candidates, y, n_splits):
+def select_model(
+    candidates: Iterable[Holt], y: Any, n_splits: int
+) -> tuple[Holt, dict[Holt, float]]:
     """Pick the best of `candidates` by rolling-origin CV, each scored with its own loss/h.
 
     Split scheme: rolling-origin, expanding-window, non-overlapping, step =
@@ -16,7 +21,7 @@ def select_model(candidates, y, n_splits):
     {candidate: mean_cv_loss} for every candidate.
     """
     y = np.asarray(y, dtype=float)
-    scores = {}
+    scores: dict[Holt, float] = {}
     for candidate in candidates:
         loss_fn = _loss_fn_from_key(_loss_key(candidate.loss, candidate.delta, candidate.tau))
         h = candidate.h
@@ -33,6 +38,6 @@ def select_model(candidates, y, n_splits):
             losses.append(float(loss_fn(test, candidate.predict())))
         scores[candidate] = float(np.mean(losses))
 
-    best = min(scores, key=scores.get)
+    best = min(scores, key=lambda c: scores[c])
     best.fit(y)
     return best, scores
