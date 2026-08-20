@@ -135,7 +135,7 @@ def test_damped_phi_stays_in_open_unit_interval():
 
 def test_damped_phi_capped_on_strongly_trending_series():
     # Superlinear growth pins phi against the upper bound; it must stop at
-    # the standard ETS damping cap (0.98), not collapse to undamped (~1).
+    # the standard classical damping cap (0.98), not collapse to undamped (~1).
     y = 100.0 + np.arange(40, dtype=float) ** 2
     model = DampedHolt(h=4, loss="mse", n_starts=10).fit(y)
     phi = model.params_[2]
