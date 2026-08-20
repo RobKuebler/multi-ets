@@ -293,6 +293,24 @@ def _compile_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     Reuses the cached (objective, grad) pair as jaxopt's value_and_grad so the
     autodiff/compile work is identical to before; only the restart loop moves
     from sequential scipy calls into a single jax.vmap'd solver.run.
+
+    Known failure mode (issue #15): a fresh (h, loss, kind) x training-length
+    shape here triggers a full XLA (re)compile of this jax.jit(jax.vmap(...))
+    graph, and #15 reported that compile occasionally never finishing / memory
+    growing without bound on CPU, for series lengths that never arise during
+    backtesting (e.g. an untruncated 150- or 400-point series). Investigated
+    for #15 by bisecting the exact reported shapes (h=6, n_starts=10, default
+    maxiter, lengths 20/48/80/100/120/150/400) plus the full run_jit_footnote()
+    reproduction from benchmarks/: none reproduced (jax 0.11.0, jaxopt 0.8.5,
+    Python 3.12; all finished in single-digit seconds). No fixable bug was
+    found in this module's code, and jaxopt has no release past 0.8.5 to pin
+    against, so this looks like an environment- or jax/jaxopt-version-
+    dependent characteristic of vmap(LBFGSB.run), not a bug introduced here.
+    If it recurs: a wall-clock guard around this call (e.g. a persistent
+    spawn-context ProcessPoolExecutor, so a runaway compile can actually be
+    killed -- plain threads can't be) is the suggested fix, but it adds enough
+    complexity/latency that it wasn't worth doing speculatively without a
+    reproduction to validate it against.
     """
     objective, grad = _compile_objective_and_grad(h, loss_key, kind)
     solver = jaxopt.LBFGSB(
