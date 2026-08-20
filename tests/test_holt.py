@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from statsmodels.tsa.holtwinters import Holt as SMHolt
 
-from multi_ets import DampedHolt, DampedHoltWinters, Holt, HoltWinters
+from multi_ets import SES, DampedHolt, DampedHoltWinters, Holt, HoltWinters
 
 
 def test_predict_returns_h_forecasts():
@@ -278,6 +278,76 @@ def test_holt_winters_multiplicative_seasonal_factors_mean_one_and_rescale_invar
 def test_holt_winters_unknown_seasonal_type_raises():
     with pytest.raises(ValueError, match="Unknown seasonal_type"):
         HoltWinters(h=4, seasonal_period=4, seasonal_type="bogus")
+
+
+def test_ses_predict_returns_h_forecasts():
+    y = np.linspace(0, 10, 20)
+    forecasts = SES(h=4, loss="mse").fit(y).predict()
+    assert np.shape(forecasts) == (4,)
+
+
+def test_ses_forecast_is_flat():
+    y = np.linspace(0, 10, 20)
+    forecasts = SES(h=4, loss="mse").fit(y).predict()
+    np.testing.assert_allclose(forecasts, np.full(4, forecasts[0]))
+
+
+def test_ses_recovers_constant_level():
+    y = np.full(20, 7.0)
+    forecasts = SES(h=3, loss="mse").fit(y).predict()
+    np.testing.assert_allclose(forecasts, np.full(3, 7.0), atol=1e-2)
+
+
+def test_ses_too_short_series_raises():
+    y = np.arange(3, dtype=float)
+    with pytest.raises(ValueError, match="too short"):
+        SES(h=5, loss="mse").fit(y)
+
+
+def test_predict_interval_contains_point_forecast():
+    y = 3.0 + 2.0 * np.arange(30)
+    model = Holt(h=5, loss="mse").fit(y)
+    lower, upper = model.predict_interval(coverage=0.9)
+    point = model.predict()
+    assert np.all(lower <= point) and np.all(point <= upper)
+
+
+def test_predict_interval_widens_with_coverage():
+    rng = np.random.default_rng(2)
+    y = 5.0 + 1.5 * np.arange(40) + rng.normal(0, 1.0, 40)
+    model = Holt(h=4, loss="mse").fit(y)
+    lower_narrow, upper_narrow = model.predict_interval(coverage=0.5)
+    lower_wide, upper_wide = model.predict_interval(coverage=0.95)
+    assert np.all((upper_wide - lower_wide) >= (upper_narrow - lower_narrow))
+
+
+def test_predict_interval_list_of_coverages_returns_dict():
+    y = 3.0 + 2.0 * np.arange(30)
+    model = Holt(h=5, loss="mse").fit(y)
+    result = model.predict_interval(coverage=[0.5, 0.9])
+    assert set(result) == {0.5, 0.9}
+    for lower, upper in result.values():
+        assert np.shape(lower) == (5,)
+        assert np.shape(upper) == (5,)
+
+
+def test_predict_interval_works_for_seasonal_model():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y = 20.0 + 1.5 * t + seasonal_true[t % m]
+    model = HoltWinters(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y)
+    lower, upper = model.predict_interval(coverage=0.9)
+    point = model.predict()
+    assert np.all(lower <= point) and np.all(point <= upper)
+
+
+def test_predict_interval_works_for_ses():
+    y = np.linspace(0, 10, 20)
+    model = SES(h=4, loss="mse").fit(y)
+    lower, upper = model.predict_interval(coverage=0.9)
+    point = model.predict()
+    assert np.all(lower <= point) and np.all(point <= upper)
 
 
 def test_attribute_set_after_construction_is_honored_at_fit():

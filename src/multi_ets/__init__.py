@@ -1,3 +1,11 @@
-from multi_ets.holt import DampedHolt, DampedHoltWinters, Holt, HoltWinters
+from multi_ets.holt import SES, DampedHolt, DampedHoltWinters, Holt, HoltWinters
+from multi_ets.selection import select_model
 
-__all__ = ["DampedHolt", "DampedHoltWinters", "Holt", "HoltWinters"]
+__all__ = [
+    "SES",
+    "DampedHolt",
+    "DampedHoltWinters",
+    "Holt",
+    "HoltWinters",
+    "select_model",
+]

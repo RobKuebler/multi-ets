@@ -15,7 +15,10 @@ uv add multi-ets   # or: pip install multi-ets
 ## Usage
 
 ```python
-from multi_ets import Holt, DampedHolt, HoltWinters, DampedHoltWinters
+from multi_ets import SES, Holt, DampedHolt, HoltWinters, DampedHoltWinters
+
+# Flat forecast, no trend.
+forecasts = SES(h=5).fit(y).predict()
 
 # Plain linear trend, forecast 5 steps ahead.
 forecasts = Holt(h=5).fit(y).predict()
@@ -34,6 +37,36 @@ forecasts = DampedHoltWinters(
 
 Every model exposes just `.fit(y)` / `.predict()`. Fitted parameters are in `.params_` after `fit()`.
 
+### Prediction intervals
+
+Every model exposes `.predict_interval(coverage=0.9)` after fitting, returning an empirical
+per-horizon-step Gaussian interval built from residuals of the fitted joint loss:
+
+```python
+lower, upper = Holt(h=5).fit(y).predict_interval(coverage=0.9)
+
+# A list of coverages returns a {coverage: (lower, upper)} dict instead.
+intervals = Holt(h=5).fit(y).predict_interval(coverage=[0.5, 0.9])
+```
+
+### Model selection
+
+`select_model` picks the best of several already-configured candidates via rolling-origin
+cross-validation, scoring each with its own `loss`/`h`:
+
+```python
+from multi_ets import select_model
+
+candidates = [
+    SES(h=5, loss="mae"),
+    HoltWinters(h=5, seasonal_period=12, loss="mae"),
+]
+best, scores = select_model(candidates, y, n_splits=3)
+forecasts = best.predict()
+```
+
+`best` is refit on the full series; `scores` maps each candidate to its mean CV loss.
+
 ### Loss
 
 All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+ `tau`), or any callable `(y_true, y_pred) -> scalar` written in `jax.numpy`.
@@ -51,6 +84,7 @@ Fitting is non-convex, so each model restarts from `n_starts` (default 10) point
 
 | Class | Trend | Seasonality |
 |---|---|---|
+| `SES` | — | — |
 | `Holt` | linear | — |
 | `DampedHolt` | damped (`phi` fit jointly) | — |
 | `HoltWinters` | linear | additive or multiplicative (`seasonal_type`) |

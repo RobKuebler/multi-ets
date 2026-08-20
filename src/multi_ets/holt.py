@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import jaxopt
 import numpy as np
 from scipy.optimize import minimize
+from scipy.stats import norm
 
 jax.config.update("jax_enable_x64", True)
 
@@ -118,7 +119,8 @@ def _seasonal_states(alpha, beta, phi, gamma, level0, trend0, season0, y, m, mul
 
 _UNPACK_UNDAMPED = lambda p: (p[0], p[1], 1.0, p[2], p[3])
 _UNPACK_DAMPED = lambda p: (p[0], p[1], p[2], p[3], p[4])
-_UNPACK_BY_KIND = {"undamped": _UNPACK_UNDAMPED, "damped": _UNPACK_DAMPED}
+_UNPACK_SES = lambda p: (p[0], 0.0, 0.0, p[1], 0.0)
+_UNPACK_BY_KIND = {"undamped": _UNPACK_UNDAMPED, "damped": _UNPACK_DAMPED, "ses": _UNPACK_SES}
 
 # Seasonal flat-params layout: box-constrained params first (matching
 # _n_trend_params: alpha, beta, [phi,] gamma), then level0, trend0, then the
@@ -143,18 +145,19 @@ def _forecast_multiplier(phi, h):
     return jnp.cumsum(phi**steps)
 
 
-def _joint_loss(params, y, h, loss_fn, unpack):
+def _forecast_matrix(params, y, h, unpack):
+    """forecasts[t, k] = forecast made at origin t for horizon step k+1, plus actuals[t, k]."""
     alpha, beta, phi, level0, trend0 = unpack(params)
     levels, trends = _states(alpha, beta, phi, level0, trend0, y)
     n_origins = len(y) - h + 1
     multiplier = _forecast_multiplier(phi, h)
-    # forecasts[t, k] = forecast made at origin t for horizon step k+1
     forecasts = levels[:n_origins, None] + multiplier[None, :] * trends[:n_origins, None]
     actuals = jnp.stack([y[t : t + h] for t in range(n_origins)])
-    return loss_fn(actuals, forecasts)
+    return forecasts, actuals
 
 
-def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative=False):
+def _forecast_matrix_seasonal(params, y, h, unpack, m, multiplicative=False):
+    """Same as _forecast_matrix but for the seasonal recursion."""
     alpha, beta, phi, gamma, level0, trend0, season0 = unpack(params, m)
     levels, trends, season_bufs = _seasonal_states(
         alpha, beta, phi, gamma, level0, trend0, season0, y, m, multiplicative
@@ -168,6 +171,16 @@ def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative=False)
     seasonal_part = season_bufs[:n_origins][:, seasonal_idx]
     forecasts = trend_part * seasonal_part if multiplicative else trend_part + seasonal_part
     actuals = jnp.stack([y[t : t + h] for t in range(n_origins)])
+    return forecasts, actuals
+
+
+def _joint_loss(params, y, h, loss_fn, unpack):
+    forecasts, actuals = _forecast_matrix(params, y, h, unpack)
+    return loss_fn(actuals, forecasts)
+
+
+def _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative=False):
+    forecasts, actuals = _forecast_matrix_seasonal(params, y, h, unpack, m, multiplicative)
     return loss_fn(actuals, forecasts)
 
 
@@ -297,6 +310,7 @@ class Holt:
 
     _kind = "undamped"
     _n_trend_params = 2  # alpha, beta
+    _n_free_params = 2  # level0, trend0
 
     def __init__(self, h, loss="mse", n_starts=10, delta=1.0, tau=0.5):
         _loss_key(loss, delta, tau)  # validate eagerly, re-resolved fresh in fit()
@@ -317,13 +331,16 @@ class Holt:
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         y_jax = jnp.asarray(y)
         run_all = _compiled_multistart(self.h, loss_key, self._kind)
-        level0_guess, trend0_guess = _heuristic_init(y)
+        # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
+        free_guess = _heuristic_init(y)[: self._n_free_params]
 
         starts = np.array(_start_grid(self.n_starts, self._n_trend_params))
-        tail = np.tile([level0_guess, trend0_guess], (len(starts), 1))
+        tail = np.tile(free_guess, (len(starts), 1))
         x0_batch = jnp.asarray(np.concatenate([starts, tail], axis=1))
-        lower = jnp.array([_BOUND_EPS] * self._n_trend_params + [-jnp.inf, -jnp.inf])
-        upper = jnp.array([1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf, jnp.inf])
+        lower = jnp.array([_BOUND_EPS] * self._n_trend_params + [-jnp.inf] * self._n_free_params)
+        upper = jnp.array(
+            [1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf] * self._n_free_params
+        )
 
         params_batch, values = run_all(x0_batch, lower, upper, y_jax)
         self.params_ = np.asarray(params_batch[jnp.argmin(values)])
@@ -337,6 +354,69 @@ class Holt:
         levels, trends = _states(alpha, beta, 1.0, level0, trend0, self._y)
         level, trend = float(levels[-1]), float(trends[-1])
         return level + np.arange(1, self.h + 1) * trend
+
+    def _resid_std(self):
+        """Per-horizon-step std of (actual - forecast) across every valid training origin.
+
+        Recomputes the forecast matrix from the fitted params, dispatching
+        seasonal vs. non-seasonal by _kind exactly like
+        _compile_objective_and_grad does. Not cached: it's one cheap forward
+        pass, and caching risks staleness across refits.
+
+        With very short series (few valid origins) this degenerates, e.g. a
+        single origin gives 0 std and an all-zero-width interval -- accepted
+        as a known limitation rather than guarded against here.
+        """
+        y_jax = jnp.asarray(self._y)
+        if self._kind in _SEASONAL_KINDS:
+            unpack = _UNPACK_SEASONAL_BY_KIND[self._kind]
+            multiplicative = self._kind in _MULTIPLICATIVE_KINDS
+            forecasts, actuals = _forecast_matrix_seasonal(
+                self.params_, y_jax, self.h, unpack, self.seasonal_period, multiplicative
+            )
+        else:
+            unpack = _UNPACK_BY_KIND[self._kind]
+            forecasts, actuals = _forecast_matrix(self.params_, y_jax, self.h, unpack)
+        return np.asarray(jnp.std(actuals - forecasts, axis=0))
+
+    def predict_interval(self, coverage=0.9):
+        """Empirical per-horizon-step Gaussian interval(s) around .predict().
+
+        coverage: a single float -> (lower, upper) array pair; a list of
+        floats -> {coverage: (lower, upper)} dict.
+        """
+        if self.params_ is None:
+            raise ValueError("Model is not fitted yet; call .fit(y) first")
+        point = self.predict()
+        std = self._resid_std()
+
+        def bounds(c):
+            z = norm.ppf(0.5 + c / 2)
+            return point - z * std, point + z * std
+
+        if isinstance(coverage, (list, tuple)):
+            return {c: bounds(c) for c in coverage}
+        return bounds(coverage)
+
+
+class SES(Holt):
+    """Simple exponential smoothing: a flat (no trend) forecast.
+
+    alpha and level0 are fit jointly against the same joint h-step loss as
+    Holt; beta/phi/trend0 are pinned to 0 so the recursion collapses to plain
+    SES and every forecast horizon step returns the same level.
+    """
+
+    _kind = "ses"
+    _n_trend_params = 1  # alpha
+    _n_free_params = 1  # level0
+
+    def predict(self):
+        if self.params_ is None:
+            raise ValueError("Model is not fitted yet; call .fit(y) first")
+        alpha, level0 = self.params_
+        levels, _ = _states(alpha, 0.0, 0.0, level0, 0.0, self._y)
+        return np.full(self.h, float(levels[-1]))
 
 
 class DampedHolt(Holt):
