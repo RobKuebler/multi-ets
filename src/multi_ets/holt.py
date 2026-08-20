@@ -20,6 +20,9 @@ jax.config.update("jax_enable_x64", True)
 Array = jax.Array
 
 _BOUND_EPS = 1e-4
+# Standard ETS damping-parameter range (Hyndman & Athanasopoulos); phi
+# approaching 1 means "no damping", which defeats the point of a damped model.
+_PHI_UPPER = 0.98
 # L-BFGS-B stopping criteria for the vmapped multi-start solver below. A low
 # maxiter is deliberate, not just a speed knob: jaxopt's LBFGSB converges
 # more thoroughly per-start than scipy's did, so a generous budget lets any
@@ -415,6 +418,8 @@ class Holt:
         x0_batch = jnp.asarray(np.concatenate([starts, tail], axis=1))
         lower = jnp.array([_BOUND_EPS] * self._n_trend_params + [-jnp.inf] * self._n_free_params)
         upper = jnp.array([1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf] * self._n_free_params)
+        if self._kind == "damped":
+            upper = upper.at[2].set(_PHI_UPPER)  # phi: cap at the ETS damping convention
 
         params_batch, values = run_all(x0_batch, lower, upper, y_jax)
         self.params_ = np.asarray(params_batch[jnp.argmin(values)])
@@ -583,6 +588,8 @@ class HoltWinters(Holt):
             + [(None, None), (None, None)]
             + season_bounds
         )
+        if self._kind.startswith("damped"):
+            bounds[2] = (_BOUND_EPS, _PHI_UPPER)  # phi: cap at the ETS damping convention
 
         best = None
         for start in _start_grid(self.n_starts, self._n_trend_params):
