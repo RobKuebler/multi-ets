@@ -133,6 +133,24 @@ def test_damped_phi_stays_in_open_unit_interval():
     assert 0 < phi < 1
 
 
+def test_damped_phi_capped_on_strongly_trending_series():
+    # Superlinear growth pins phi against the upper bound; it must stop at
+    # the standard ETS damping cap (0.98), not collapse to undamped (~1).
+    y = 100.0 + np.arange(40, dtype=float) ** 2
+    model = DampedHolt(h=4, loss="mse", n_starts=10).fit(y)
+    phi = model.params_[2]
+    assert phi <= 0.98
+
+
+def test_damped_holt_winters_phi_capped_on_strongly_trending_series():
+    m = 4
+    t = np.arange(48)
+    y = 100.0 + t.astype(float) ** 2 + np.tile([5.0, -3.0, -4.0, 2.0], 12)
+    model = DampedHoltWinters(h=4, seasonal_period=m, loss="mse", n_starts=10).fit(y)
+    phi = model.params_[2]
+    assert phi <= 0.98
+
+
 def test_damped_beats_undamped_on_trend_that_levels_off():
     h = 4
     t = np.arange(1, 31)
