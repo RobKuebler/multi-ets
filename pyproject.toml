@@ -23,6 +23,11 @@ dev = [
     "statsmodels>=0.14",
     "ty>=0.0.73",
 ]
+benchmark = [
+    "statsforecast>=2.0",
+    "matplotlib>=3.8",
+    "pandas>=2.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
@@ -44,6 +49,7 @@ convention = "numpy"
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["D", "ANN"]
 "examples/*" = ["D", "ANN"]
+"benchmarks/*" = ["D", "ANN"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
