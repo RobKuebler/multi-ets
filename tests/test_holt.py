@@ -165,6 +165,84 @@ def test_hand_derived_grad_matches_jax_autodiff_with_padding():
     np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
 
 
+def _rand_seasonal_params(rng, kind, m, multiplicative):
+    season0 = rng.uniform(0.5, 1.5, m) if multiplicative else rng.uniform(-1.0, 1.0, m)
+    level0, trend0 = rng.uniform(-1.0, 1.0, 2)
+    if kind.startswith("damped"):
+        alpha, beta, gamma = rng.uniform(0.1, 0.9, 3)
+        phi = rng.uniform(0.1, holt_module._PHI_UPPER)  # exercise up to the classical damping cap
+        return np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
+    alpha, beta, gamma = rng.uniform(0.1, 0.9, 3)
+    return np.concatenate([[alpha, beta, gamma, level0, trend0], season0])
+
+
+@pytest.mark.parametrize(
+    "loss_name,delta,tau",
+    [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
+)
+@pytest.mark.parametrize(
+    "kind", ["seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult"]
+)
+def test_seasonal_hand_derived_grad_matches_jax_autodiff(kind, loss_name, delta, tau):
+    # #19: HoltWinters/DampedHoltWinters.fit()'s hand-derived seasonal BPTT
+    # gradient (_seasonal_objective_and_grad) must agree with the JAX autodiff
+    # gradient it replaces, for every built-in loss, additive+multiplicative,
+    # undamped+damped.
+    rng = np.random.default_rng(2)
+    h = 3
+    m = 4
+    multiplicative = kind in holt_module._MULTIPLICATIVE_KINDS
+    y = np.cumsum(rng.normal(0, 1, 20)) + 10
+    if multiplicative:
+        y = y - y.min() + 5.0  # keep the series positive for y_t/level, y_t/s_old
+    unpack = holt_module._UNPACK_SEASONAL_BY_KIND[kind]
+    loss_key = (loss_name, delta, tau)
+    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
+    p = _rand_seasonal_params(rng, kind, m, multiplicative)
+
+    def jax_loss(params):
+        return holt_module._joint_loss_seasonal(
+            params, jnp.asarray(y), h, loss_fn_jax, unpack, m, multiplicative
+        )
+
+    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
+    _, grad = holt_module._seasonal_objective_and_grad(p, y, h, kind, m, loss_key)
+
+    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
+
+
+@pytest.mark.parametrize("kind", ["seasonal", "damped_seasonal"])
+def test_seasonal_hand_derived_grad_matches_jax_autodiff_with_padding(kind):
+    # HoltWinters.fit()/DampedHoltWinters.fit() fit additive kinds on a
+    # bucket-padded, masked series (_pad_to_bucket) -- the parametrized test
+    # above never exercises this, since it never passes n_valid. That masked
+    # branch is the one every real additive .fit() call actually uses (both
+    # undamped and damped), so it needs its own jax-vs-numpy cross-check
+    # (mirrors test_hand_derived_grad_matches_jax_autodiff_with_padding).
+    rng = np.random.default_rng(3)
+    h = 3
+    m = 4
+    y = np.cumsum(rng.normal(0, 1, 13)) + 10  # 13 -> pads to 16
+    y_padded = holt_module._pad_to_bucket(y)
+    assert len(y_padded) > len(y)  # sanity: this length actually needs padding
+    unpack = holt_module._UNPACK_SEASONAL_BY_KIND[kind]
+    loss_key = ("mse", 1.0, 0.5)
+    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
+    p = _rand_seasonal_params(rng, kind, m, multiplicative=False)
+
+    def jax_loss(params):
+        return holt_module._joint_loss_seasonal(
+            params, jnp.asarray(y_padded), h, loss_fn_jax, unpack, m, n_valid=len(y)
+        )
+
+    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
+    _, grad = holt_module._seasonal_objective_and_grad(
+        p, y_padded, h, kind, m, loss_key, n_valid=len(y)
+    )
+
+    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
+
+
 def test_unknown_loss_raises():
     with pytest.raises(ValueError, match="Unknown loss"):
         Holt(h=3, loss="bogus")

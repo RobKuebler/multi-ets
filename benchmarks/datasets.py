@@ -278,18 +278,17 @@ def _synthetic_series() -> list[Series]:
     series.append(
         Series("synthetic_high_noise", make_synthetic(extra, noise_std=25.0), extra, "synthetic")
     )
-    # ponytail: short/long series each introduce a train length the JAX
-    # multistart solver hasn't compiled before, and that compile runs away
-    # in memory (OOM-killed a full benchmark run). Skipped until that's
-    # diagnosed -- re-enable once _compile_multistart in holt.py is fixed.
-    # short = Structure("damped", "mul", m)
-    # series.append(
-    #     Series("synthetic_short_series", make_synthetic(short, length=48), short, "synthetic")
-    # )
-    # long_ = Structure("add", "none")
-    # series.append(
-    #     Series("synthetic_long_series", make_synthetic(long_, length=400), long_, "synthetic")
-    # )
+    # Re-enabled by #19: both used to hit the JAX multistart solver's
+    # per-length compile, which OOM'd on an unseen train length -- neither
+    # Holt nor HoltWinters calls that solver anymore (#18, #19).
+    short = Structure("damped", "mul", m)
+    series.append(
+        Series("synthetic_short_series", make_synthetic(short, length=48), short, "synthetic")
+    )
+    long_ = Structure("add", "none")
+    series.append(
+        Series("synthetic_long_series", make_synthetic(long_, length=400), long_, "synthetic")
+    )
     return series
 
 

@@ -561,6 +561,12 @@ def _forecast_multiplier_np(phi: float, h: int) -> np.ndarray:
     return np.cumsum(phi**steps)
 
 
+def _forecast_multiplier_grad_np(phi: float, h: int) -> np.ndarray:
+    """d(_forecast_multiplier_np(phi, h))/d(phi); shared by both BPTT passes below."""
+    steps = np.arange(1, h + 1)
+    return np.cumsum(steps * phi ** (steps - 1))
+
+
 def _states_np(
     alpha: float, beta: float, phi: float, level0: float, trend0: float, y: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -611,8 +617,7 @@ def _states_bptt_grad_np(
     n_origins = d_forecast.shape[0]
     gl_direct = d_forecast.sum(axis=1)
     gt_direct = d_forecast @ multiplier
-    steps = np.arange(1, h + 1)
-    d_multiplier_d_phi = np.cumsum(steps * phi ** (steps - 1))
+    d_multiplier_d_phi = _forecast_multiplier_grad_np(phi, h)
     d_phi = float(np.sum(trends[:n_origins] * (d_forecast @ d_multiplier_d_phi)))
 
     d_alpha = 0.0
@@ -683,6 +688,276 @@ def _holt_objective_and_grad(
     d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask)
     grad5 = _states_bptt_grad_np(alpha, beta, phi, levels, trends, y, d_forecast, multiplier, h)
     return value, _PACK_GRAD_BY_KIND[kind](grad5)
+
+
+# --- Hand-derived (NumPy, no JAX) fitting path for the seasonal kinds (#19) ---
+#
+# Reuses _loss_value_np/_loss_grad_np (#18) unchanged for the outer
+# d(loss)/d(forecast) step; only the recursion this backprops through differs
+# (_seasonal_states_np instead of _states_np), including the multiplicative
+# combine, which changes the local partial derivatives at every step
+# (division rules, not the additive case's linear combination) -- not just
+# the forward formula.
+
+
+def _seasonal_states_np(
+    alpha: float,
+    beta: float,
+    phi: float,
+    gamma: float,
+    level0: float,
+    trend0: float,
+    season0: np.ndarray,
+    y: np.ndarray,
+    m: int,
+    multiplicative: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Mirrors _seasonal_states, but a plain Python/NumPy loop instead of jax.lax.scan."""
+    t_max = len(y)
+    levels = np.empty(t_max + 1)
+    trends = np.empty(t_max + 1)
+    season_bufs = np.empty((t_max + 1, m))
+    levels[0], trends[0] = level0, trend0
+    season_bufs[0] = season0
+    for t in range(t_max):
+        level, trend = levels[t], trends[t]
+        s_old = season_bufs[t, 0]
+        if multiplicative:
+            new_level = alpha * (y[t] / s_old) + (1 - alpha) * (level + phi * trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+            new_season = gamma * (y[t] / new_level) + (1 - gamma) * s_old
+        else:
+            new_level = alpha * (y[t] - s_old) + (1 - alpha) * (level + phi * trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+            new_season = gamma * (y[t] - new_level) + (1 - gamma) * s_old
+        levels[t + 1] = new_level
+        trends[t + 1] = new_trend
+        season_bufs[t + 1, :-1] = season_bufs[t, 1:]
+        season_bufs[t + 1, -1] = new_season
+    return levels, trends, season_bufs
+
+
+def _seasonal_forward_np(
+    params: np.ndarray, y: np.ndarray, h: int, kind: str, m: int
+) -> tuple[Any, ...]:
+    """(alpha, beta, phi, gamma, levels, trends, season_bufs, multiplier, trend_part, ...).
+
+    seasonal_part, forecasts, actuals -- for one params guess. Mirrors _holt_forward_np.
+    """
+    alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[kind](params, m)
+    multiplicative = kind in _MULTIPLICATIVE_KINDS
+    levels, trends, season_bufs = _seasonal_states_np(
+        alpha, beta, phi, gamma, level0, trend0, season0, y, m, multiplicative
+    )
+    n_origins = len(y) - h + 1
+    multiplier = _forecast_multiplier_np(phi, h)
+    trend_part = levels[:n_origins, None] + multiplier[None, :] * trends[:n_origins, None]
+    seasonal_idx = np.arange(h) % m
+    seasonal_part = season_bufs[:n_origins][:, seasonal_idx]
+    forecasts = trend_part * seasonal_part if multiplicative else trend_part + seasonal_part
+    actuals = np.stack([y[t : t + h] for t in range(n_origins)])
+    return (
+        alpha,
+        beta,
+        phi,
+        gamma,
+        levels,
+        trends,
+        season_bufs,
+        multiplier,
+        trend_part,
+        seasonal_part,
+        forecasts,
+        actuals,
+    )
+
+
+def _seasonal_states_bptt_grad_np(
+    alpha: float,
+    beta: float,
+    phi: float,
+    gamma: float,
+    levels: np.ndarray,
+    trends: np.ndarray,
+    season_bufs: np.ndarray,
+    y: np.ndarray,
+    d_forecast: np.ndarray,
+    multiplier: np.ndarray,
+    trend_part: np.ndarray,
+    seasonal_part: np.ndarray,
+    h: int,
+    m: int,
+    multiplicative: bool,
+) -> tuple[float, float, float, float, float, float, np.ndarray]:
+    """BPTT gradient of the joint loss wrt (alpha, beta, phi, gamma, level0, ...).
+
+    trend0, season0 -- through the seasonal recursion. d_forecast is
+    d(loss)/d(forecast) (see _loss_grad_np); levels/trends/
+    season_bufs are _seasonal_states_np's full output. Mirrors what
+    jax.grad(_joint_loss_seasonal) computed automatically, extended for the
+    season buffer (season0 is a free parameter too, so it needs its own
+    gradient) and for the multiplicative combine (y_t/s_old, y_t/new_level),
+    which swaps the additive case's linear local derivatives for division
+    rules at every step.
+
+    Each step's new_level feeds both new_trend and the newly appended season
+    value (new_season); both of those are "outputs" of the same step, so the
+    combined incoming gradient on new_level (gl_full below) must account for
+    both paths before it's used to derive parameter gradients and backflow
+    into the previous step's state -- mirroring how _states_bptt_grad_np
+    folds new_trend's dependency on new_level into its own gl_t/gt_t combo,
+    just with one more consumer.
+    """
+    n_origins = d_forecast.shape[0]
+    idx = np.arange(h) % m
+
+    if multiplicative:
+        dF_dlevel = seasonal_part
+        dF_dtrend = multiplier[None, :] * seasonal_part
+        dF_dbuf_weight = trend_part
+    else:
+        dF_dlevel = np.ones_like(seasonal_part)
+        dF_dtrend = np.broadcast_to(multiplier[None, :], seasonal_part.shape)
+        dF_dbuf_weight = np.ones_like(seasonal_part)
+
+    gl_direct = (d_forecast * dF_dlevel).sum(axis=1)
+    gt_direct = (d_forecast * dF_dtrend).sum(axis=1)
+    gb_direct = np.zeros((n_origins, m))
+    weighted = d_forecast * dF_dbuf_weight
+    for j in range(m):
+        gb_direct[:, j] = weighted[:, idx == j].sum(axis=1)
+
+    d_multiplier_d_phi = _forecast_multiplier_grad_np(phi, h)
+    mult_weight = (d_forecast * (seasonal_part if multiplicative else 1.0)) @ d_multiplier_d_phi
+    d_phi = float(np.sum(trends[:n_origins] * mult_weight))
+
+    d_alpha = 0.0
+    d_beta = 0.0
+    d_gamma = 0.0
+    gl_next = 0.0
+    gt_next = 0.0
+    gb_next = np.zeros(m)
+    for t in range(n_origins - 1, 0, -1):
+        gl = gl_direct[t] + gl_next
+        gt = gt_direct[t] + gt_next
+        gb = gb_direct[t] + gb_next
+
+        level_prev, trend_prev = levels[t - 1], trends[t - 1]
+        s_old = season_bufs[t - 1, 0]
+        y_prev = y[t - 1]
+        new_level = levels[t]
+
+        if multiplicative:
+            f = y_prev / s_old
+            g = y_prev / new_level
+            df_ds_old = -y_prev / s_old**2
+            dg_dlevel = -y_prev / new_level**2
+        else:
+            f = y_prev - s_old
+            g = y_prev - new_level
+            df_ds_old = -1.0
+            dg_dlevel = -1.0
+
+        gS = gb[-1]  # gradient wrt the season value new_season_{t-1} just appended
+        # new_level feeds both new_trend and new_season, so both paths count here.
+        gl_full = gl + beta * gt + gS * gamma * dg_dlevel
+
+        d_alpha += gl_full * (f - (level_prev + phi * trend_prev))
+        d_beta += gt * (new_level - level_prev - phi * trend_prev)
+        d_phi += trend_prev * (gl_full * (1 - alpha) + gt * (1 - beta))
+        d_gamma += gS * (g - s_old)
+
+        gl_next = gl_full * (1 - alpha) - beta * gt
+        gt_next = phi * (gl_full * (1 - alpha) + gt * (1 - beta))
+        next_gb = np.empty(m)
+        next_gb[0] = gl_full * alpha * df_ds_old + gS * (1 - gamma)
+        next_gb[1:] = gb[:-1]
+        gb_next = next_gb
+
+    d_level0 = gl_direct[0] + gl_next
+    d_trend0 = gt_direct[0] + gt_next
+    d_season0 = gb_direct[0] + gb_next
+    return d_alpha, d_beta, d_phi, d_gamma, d_level0, d_trend0, d_season0
+
+
+def _pack_grad_seasonal(
+    d: tuple[float, float, float, float, float, float, np.ndarray],
+) -> np.ndarray:
+    d_alpha, d_beta, _d_phi, d_gamma, d_level0, d_trend0, d_season0 = d
+    return np.concatenate([[d_alpha, d_beta, d_gamma, d_level0, d_trend0], d_season0])
+
+
+def _pack_grad_damped_seasonal(
+    d: tuple[float, float, float, float, float, float, np.ndarray],
+) -> np.ndarray:
+    d_alpha, d_beta, d_phi, d_gamma, d_level0, d_trend0, d_season0 = d
+    return np.concatenate([[d_alpha, d_beta, d_phi, d_gamma, d_level0, d_trend0], d_season0])
+
+
+# "_mult" kinds share the additive kind's flat-params layout and gradient
+# packing (see _UNPACK_SEASONAL_BY_KIND); only the recursion differs.
+_PACK_GRAD_SEASONAL_BY_KIND = {
+    "seasonal": _pack_grad_seasonal,
+    "damped_seasonal": _pack_grad_damped_seasonal,
+    "seasonal_mult": _pack_grad_seasonal,
+    "damped_seasonal_mult": _pack_grad_damped_seasonal,
+}
+
+
+def _seasonal_objective_and_grad(
+    params: np.ndarray,
+    y: np.ndarray,
+    h: int,
+    kind: str,
+    m: int,
+    loss_key: tuple[str, float, float],
+    n_valid: int | None = None,
+) -> tuple[float, np.ndarray]:
+    """(loss, grad) for the seasonal Holt-Winters recursion, hand-derived (#19).
+
+    grad has the same length/layout as params (per _UNPACK_SEASONAL_BY_KIND[kind]).
+    Mirrors _holt_objective_and_grad's non-seasonal shape; loss_key must be a
+    resolved built-in key (see _loss_key) -- callers fall back to scipy's own
+    finite-difference jac for custom callables, since those aren't
+    differentiated here.
+    """
+    multiplicative = kind in _MULTIPLICATIVE_KINDS
+    (
+        alpha,
+        beta,
+        phi,
+        gamma,
+        levels,
+        trends,
+        season_bufs,
+        multiplier,
+        trend_part,
+        seasonal_part,
+        forecasts,
+        actuals,
+    ) = _seasonal_forward_np(params, y, h, kind, m)
+    n_origins = forecasts.shape[0]
+    mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
+    value = _loss_value_np(loss_key, actuals, forecasts, mask)
+    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask)
+    grad_tuple = _seasonal_states_bptt_grad_np(
+        alpha,
+        beta,
+        phi,
+        gamma,
+        levels,
+        trends,
+        season_bufs,
+        y,
+        d_forecast,
+        multiplier,
+        trend_part,
+        seasonal_part,
+        h,
+        m,
+        multiplicative,
+    )
+    return value, _PACK_GRAD_SEASONAL_BY_KIND[kind](grad_tuple)
 
 
 class Holt:
@@ -913,8 +1188,17 @@ class HoltWinters(Holt):
         # (confirmed by direct simulation). Padding is skipped here; the
         # bucketing benefit is only safe for the additive/non-seasonal kinds.
         y_fit = y if (custom or multiplicative) else _pad_to_bucket(y)
-        y_jax = jnp.asarray(y_fit)
-        objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind, m, len(y_fit))
+        n_valid = len(y)
+
+        def objective(p: np.ndarray) -> Any:
+            if custom:
+                # No hand-derived gradient for an arbitrary user loss; scipy's
+                # jac=False below falls back to its own finite-difference
+                # estimate -- this path no longer imports jax at all (#19).
+                forecasts, actuals = _seasonal_forward_np(p, y_fit, self.h, self._kind, m)[-2:]
+                return float(loss_key(actuals, forecasts))
+            return _seasonal_objective_and_grad(p, y_fit, self.h, self._kind, m, loss_key, n_valid)
+
         if multiplicative:
             level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
                 y, m
@@ -934,13 +1218,7 @@ class HoltWinters(Holt):
         best = None
         for start in _start_grid(self.n_starts, self._n_trend_params):
             x0 = np.concatenate([start, [level0_guess, trend0_guess], season0_guess])
-            result = minimize(
-                lambda p: float(objective(p, y_jax, len(y))),
-                x0,
-                jac=lambda p: np.asarray(grad(p, y_jax, len(y))),
-                method="L-BFGS-B",
-                bounds=bounds,
-            )
+            result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
             if best is None or result.fun < best.fun:
                 best = result
 
