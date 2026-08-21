@@ -398,3 +398,78 @@ def test_compiled_multistart_cache_stays_bounded_across_many_lengths(monkeypatch
         SES(h=1, n_starts=1).fit(y)
 
     assert small_cache.cache_info().currsize <= 2
+
+
+def test_bucket_length_is_smallest_power_of_two_at_least_n():
+    assert holt_module._bucket_length(1) == 1
+    assert holt_module._bucket_length(5) == 8
+    assert holt_module._bucket_length(8) == 8
+    assert holt_module._bucket_length(9) == 16
+
+
+def test_pad_to_bucket_repeats_last_value_and_is_a_noop_at_a_power_of_two():
+    padded = holt_module._pad_to_bucket(np.array([1.0, 2.0, 3.0]))
+    np.testing.assert_array_equal(padded, [1.0, 2.0, 3.0, 3.0])
+
+    y8 = np.arange(8.0)
+    assert holt_module._pad_to_bucket(y8) is y8  # already a bucket length: no-op
+
+
+def test_padded_joint_loss_is_bit_exact_with_unpadded():
+    # Correctness bar for #17: padding a training array to a bucket length
+    # and masking out the padded origins must reproduce the unpadded joint
+    # loss bit-for-bit, not just approximately -- fitted params must not move.
+    y = np.linspace(-1.0, 2.0, 13)  # 13 -> pads to 16
+    h = 3
+    unpack = holt_module._UNPACK_BY_KIND["undamped"]
+    loss_fn = holt_module._loss_fn_from_key(holt_module._loss_key("mse", 1.0, 0.5))
+    params = np.array([0.3, 0.2, 5.0, 1.0])
+
+    unpadded = holt_module._joint_loss(params, jnp.asarray(y), h, loss_fn, unpack)
+
+    y_padded = holt_module._pad_to_bucket(y)
+    assert len(y_padded) > len(y)  # sanity: this length actually needs padding
+    padded = holt_module._joint_loss(
+        params, jnp.asarray(y_padded), h, loss_fn, unpack, n_valid=len(y)
+    )
+
+    assert padded == unpadded
+
+
+def test_expanding_window_refits_share_one_compiled_shape(monkeypatch):
+    # Regression test for #17: rolling-origin backtests refit at every
+    # expanding-window length (n, n+h, n+2h, ...), and each distinct length
+    # used to force a fresh XLA compile since a fresh length never repeats
+    # within one backtest. Bucketing to the next power of two means every
+    # length in [5, 8] now shares bucket 8, so this cache should see the same
+    # single entry hit on every refit after the first.
+    def _build(h, loss_key, kind, n):  # mirrors _compiled_multistart_cached's signature
+        return holt_module._compile_multistart(h, loss_key, kind)
+
+    small_cache = functools.lru_cache(maxsize=2)(_build)
+    monkeypatch.setattr(holt_module, "_compiled_multistart_cached", small_cache)
+
+    for length in range(5, 9):  # expanding window: 5, 6, 7, 8
+        y = np.linspace(0, 1, length)
+        SES(h=1, n_starts=1).fit(y)
+
+    assert small_cache.cache_info().hits >= 3  # only the first length misses
+    assert small_cache.cache_info().currsize == 1
+
+
+def test_multiplicative_seasonal_fit_skips_bucket_padding(monkeypatch):
+    # Regression test: the multiplicative seasonal recursion (y_t/s_old,
+    # y_t/level) is a ratio, not a convex combination like every other kind,
+    # so it isn't provably bounded the way the additive/non-seasonal kinds
+    # are (spectral radius < 1 everywhere in the alpha/beta/(phi) box).
+    # Direct simulation confirms it blows up toward +-inf/0 well within
+    # float64 range at plausible multi-start corners when iterated hundreds
+    # of steps beyond the real series length -- exactly what bucket-padding
+    # would do -- so #17's padding must never apply here.
+    def _boom(y):
+        raise AssertionError("must not bucket-pad a multiplicative-seasonal fit")
+
+    monkeypatch.setattr(holt_module, "_pad_to_bucket", _boom)
+    y = 10.0 + 0.1 * np.arange(30) + np.tile([1.0, 1.2, 0.8], 10)
+    model = HoltWinters(h=2, seasonal_period=3, seasonal_type="multiplicative", n_starts=2).fit(y)
+    assert np.all(np.isfinite(model.params_))

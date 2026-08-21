@@ -42,23 +42,38 @@ _LBFGSB_TOL = 1e-6
 _COMPILE_CACHE_SIZE = 16
 
 
-def _huber(residual: Any, delta: float) -> Array:
+def _masked_mean(x: Any, mask: Any | None) -> Array:
+    """jnp.mean(x), or a mean over only the rows where mask is True.
+
+    mask is None means "no padding" (the plain mean). Otherwise mask is a
+    per-origin (axis-0) boolean array; masked-out rows are zeroed before
+    summing, which is exact (not approximate) because summing extra 0.0
+    terms never perturbs an IEEE-754 float sum -- so this reproduces
+    jnp.mean over just the valid rows bit-for-bit (see #17 / _pad_to_bucket).
+    """
+    if mask is None:
+        return jnp.mean(x)
+    weighted = jnp.where(mask[:, None], x, 0.0)
+    return jnp.sum(weighted) / (jnp.sum(mask) * x.shape[-1])
+
+
+def _huber(residual: Any, delta: float, mask: Any | None = None) -> Array:
     abs_r = jnp.abs(residual)
     quadratic = jnp.minimum(abs_r, delta)
     linear = abs_r - quadratic
-    return jnp.mean(0.5 * quadratic**2 + delta * linear)
+    return _masked_mean(0.5 * quadratic**2 + delta * linear, mask)
 
 
-def _pinball(y_true: Any, y_pred: Any, tau: float) -> Array:
+def _pinball(y_true: Any, y_pred: Any, tau: float, mask: Any | None = None) -> Array:
     e = y_true - y_pred
-    return jnp.mean(jnp.maximum(tau * e, (tau - 1) * e))
+    return _masked_mean(jnp.maximum(tau * e, (tau - 1) * e), mask)
 
 
 _LOSS_BUILDERS = {
-    "mse": lambda delta, tau: lambda yt, yp: jnp.mean((yp - yt) ** 2),
-    "mae": lambda delta, tau: lambda yt, yp: jnp.mean(jnp.abs(yp - yt)),
-    "huber": lambda delta, tau: lambda yt, yp: _huber(yp - yt, delta),
-    "pinball": lambda delta, tau: lambda yt, yp: _pinball(yt, yp, tau),
+    "mse": lambda delta, tau: lambda yt, yp, mask=None: _masked_mean((yp - yt) ** 2, mask),
+    "mae": lambda delta, tau: lambda yt, yp, mask=None: _masked_mean(jnp.abs(yp - yt), mask),
+    "huber": lambda delta, tau: lambda yt, yp, mask=None: _huber(yp - yt, delta, mask),
+    "pinball": lambda delta, tau: lambda yt, yp, mask=None: _pinball(yt, yp, tau, mask),
 }
 
 
@@ -191,17 +206,30 @@ def _forecast_multiplier(phi: Any, h: int) -> Array:
     return jnp.cumsum(phi**steps)
 
 
+def _origin_mask(n_origins: int, n_valid: Any | None, h: int) -> Any | None:
+    """None (no padding), or a bool[n_origins] marking origins backed by real (unpadded) data."""
+    if n_valid is None:
+        return None
+    return jnp.arange(n_origins) < (n_valid - h + 1)
+
+
 def _forecast_matrix(
-    params: Any, y: Any, h: int, unpack: Callable[..., Any]
-) -> tuple[Array, Array]:
-    """forecasts[t, k] = forecast made at origin t for horizon step k+1, plus actuals[t, k]."""
+    params: Any, y: Any, h: int, unpack: Callable[..., Any], n_valid: Any | None = None
+) -> tuple[Array, Array, Array | None]:
+    """forecasts[t, k] = forecast made at origin t for horizon step k+1, plus actuals[t, k].
+
+    n_valid, if given, is the real (pre-padding) series length; the returned
+    mask marks which origin rows are backed by real data vs. right-padding
+    (see _pad_to_bucket) and is None when n_valid is None (no padding, i.e.
+    the previous unmasked behavior).
+    """
     alpha, beta, phi, level0, trend0 = unpack(params)
     levels, trends = _states(alpha, beta, phi, level0, trend0, y)
     n_origins = len(y) - h + 1
     multiplier = _forecast_multiplier(phi, h)
     forecasts = levels[:n_origins, None] + multiplier[None, :] * trends[:n_origins, None]
     actuals = jnp.stack([y[t : t + h] for t in range(n_origins)])
-    return forecasts, actuals
+    return forecasts, actuals, _origin_mask(n_origins, n_valid, h)
 
 
 def _forecast_matrix_seasonal(
@@ -211,7 +239,8 @@ def _forecast_matrix_seasonal(
     unpack: Callable[..., Any],
     m: int,
     multiplicative: bool = False,
-) -> tuple[Array, Array]:
+    n_valid: Any | None = None,
+) -> tuple[Array, Array, Array | None]:
     """Mirror _forecast_matrix, but for the seasonal recursion."""
     alpha, beta, phi, gamma, level0, trend0, season0 = unpack(params, m)
     levels, trends, season_bufs = _seasonal_states(
@@ -226,14 +255,19 @@ def _forecast_matrix_seasonal(
     seasonal_part = season_bufs[:n_origins][:, seasonal_idx]
     forecasts = trend_part * seasonal_part if multiplicative else trend_part + seasonal_part
     actuals = jnp.stack([y[t : t + h] for t in range(n_origins)])
-    return forecasts, actuals
+    return forecasts, actuals, _origin_mask(n_origins, n_valid, h)
 
 
 def _joint_loss(
-    params: Any, y: Any, h: int, loss_fn: Callable[..., Any], unpack: Callable[..., Any]
+    params: Any,
+    y: Any,
+    h: int,
+    loss_fn: Callable[..., Any],
+    unpack: Callable[..., Any],
+    n_valid: Any | None = None,
 ) -> Array:
-    forecasts, actuals = _forecast_matrix(params, y, h, unpack)
-    return loss_fn(actuals, forecasts)
+    forecasts, actuals, mask = _forecast_matrix(params, y, h, unpack, n_valid)
+    return loss_fn(actuals, forecasts) if mask is None else loss_fn(actuals, forecasts, mask)
 
 
 def _joint_loss_seasonal(
@@ -244,28 +278,41 @@ def _joint_loss_seasonal(
     unpack: Callable[..., Any],
     m: int,
     multiplicative: bool = False,
+    n_valid: Any | None = None,
 ) -> Array:
-    forecasts, actuals = _forecast_matrix_seasonal(params, y, h, unpack, m, multiplicative)
-    return loss_fn(actuals, forecasts)
+    forecasts, actuals, mask = _forecast_matrix_seasonal(
+        params, y, h, unpack, m, multiplicative, n_valid
+    )
+    return loss_fn(actuals, forecasts) if mask is None else loss_fn(actuals, forecasts, mask)
 
 
 def _compile_objective_and_grad(
     h: int, loss_key: Any, kind: str, m: int | None = None
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Build (objective, grad), both taking (params, y, n_valid).
+
+    n_valid is always accepted for a uniform call signature, but is only
+    forwarded to the padding/masking scheme in _pad_to_bucket for built-in
+    (str/tuple-keyed) losses; custom callables ignore it, since their loss_fn
+    keeps the user-facing 2-arg (y_true, y_pred) signature untouched.
+    """
     loss_fn = _loss_fn_from_key(loss_key)
+    custom = callable(loss_key)
 
     if kind in _SEASONAL_KINDS:
         assert m is not None  # callers always pass seasonal_period for seasonal kinds
         unpack = _UNPACK_SEASONAL_BY_KIND[kind]
         multiplicative = kind in _MULTIPLICATIVE_KINDS
 
-        def objective(params: Any, y: Any) -> Array:
-            return _joint_loss_seasonal(params, y, h, loss_fn, unpack, m, multiplicative)
+        def objective(params: Any, y: Any, n_valid: Any) -> Array:
+            return _joint_loss_seasonal(
+                params, y, h, loss_fn, unpack, m, multiplicative, None if custom else n_valid
+            )
     else:
         unpack = _UNPACK_BY_KIND[kind]
 
-        def objective(params: Any, y: Any) -> Array:
-            return _joint_loss(params, y, h, loss_fn, unpack)
+        def objective(params: Any, y: Any, n_valid: Any) -> Array:
+            return _joint_loss(params, y, h, loss_fn, unpack, None if custom else n_valid)
 
     return jax.jit(objective), jax.jit(jax.grad(objective))
 
@@ -323,18 +370,23 @@ def _compile_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     cache key one level up (_compiled_multistart_cached), so each distinct
     length gets its own closure that can be evicted and garbage-collected
     instead of accumulating inside a single unbounded one.
+
+    run_all takes a uniform (x0_batch, lower, upper, y, n_valid); n_valid (the
+    real, pre-padding series length) enables the padding/masking scheme in
+    _pad_to_bucket for built-in losses and is ignored for custom callables --
+    see _compile_objective_and_grad.
     """
     objective, grad = _compile_objective_and_grad(h, loss_key, kind)
     solver = jaxopt.LBFGSB(
-        fun=lambda p, y: (objective(p, y), grad(p, y)),
+        fun=lambda p, y, n_valid: (objective(p, y, n_valid), grad(p, y, n_valid)),
         value_and_grad=True,
         maxiter=_LBFGSB_MAXITER,
         tol=_LBFGSB_TOL,
     )
 
-    def run_all(x0_batch: Any, lower: Any, upper: Any, y: Any) -> tuple[Any, Any]:
+    def run_all(x0_batch: Any, lower: Any, upper: Any, y: Any, n_valid: Any) -> tuple[Any, Any]:
         def run_one(x0: Any) -> Any:
-            return solver.run(x0, (lower, upper), y)
+            return solver.run(x0, (lower, upper), y, n_valid)
 
         params, state = jax.vmap(run_one)(x0_batch)
         return params, state.value
@@ -358,6 +410,33 @@ def _compiled_multistart(h: int, loss_key: Any, kind: str, n: int) -> Callable[.
     if callable(loss_key):
         return _compile_multistart(h, loss_key, kind)
     return _compiled_multistart_cached(h, loss_key, kind, n)
+
+
+def _bucket_length(n: int) -> int:
+    """Smallest power of two >= n."""
+    return 1 << (n - 1).bit_length()
+
+
+def _pad_to_bucket(y: np.ndarray) -> np.ndarray:
+    """Right-pad y (by repeating its last value) to the next power-of-two length.
+
+    Rolling-origin backtests refit at every expanding-window length (n, n+h,
+    n+2h, ...), and each distinct length used to force a fresh XLA compile in
+    the caches above (#17) since a fresh length never repeats within one
+    backtest. Rounding up to a shared bucket length collapses the distinct
+    shapes a backtest produces from O(n) to O(log n), so far more folds land
+    on an already-compiled shape.
+
+    This is safe because the recursion is causal: states at any real (t <
+    len(y)) origin only ever depend on y[:t], so padding at the tail can't
+    change them, and the padded origins themselves are excluded from the
+    loss via the n_valid mask threaded through _forecast_matrix /
+    _forecast_matrix_seasonal -- so fitted parameters are unaffected.
+    """
+    n_pad = _bucket_length(len(y))
+    if n_pad == len(y):
+        return y
+    return np.pad(y, (0, n_pad - len(y)), mode="edge")
 
 
 def _heuristic_init(y: Any) -> tuple[float, float]:
@@ -441,8 +520,10 @@ class Holt:
             )
 
         loss_key = _loss_key(self.loss, self.delta, self.tau)
-        y_jax = jnp.asarray(y)
-        run_all = _compiled_multistart(self.h, loss_key, self._kind, len(y))
+        custom = callable(loss_key)
+        y_fit = y if custom else _pad_to_bucket(y)
+        y_jax = jnp.asarray(y_fit)
+        run_all = _compiled_multistart(self.h, loss_key, self._kind, len(y_fit))
         # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
         free_guess = _heuristic_init(y)[: self._n_free_params]
 
@@ -454,7 +535,7 @@ class Holt:
         if self._kind == "damped":
             upper = upper.at[2].set(_PHI_UPPER)  # phi: cap at the classical damping convention
 
-        params_batch, values = run_all(x0_batch, lower, upper, y_jax)
+        params_batch, values = run_all(x0_batch, lower, upper, y_jax, len(y))
         self.params_ = np.asarray(params_batch[jnp.argmin(values)])
         self._y = y
         return self
@@ -485,12 +566,12 @@ class Holt:
             assert self.seasonal_period is not None  # set by HoltWinters for seasonal kinds
             unpack = _UNPACK_SEASONAL_BY_KIND[self._kind]
             multiplicative = self._kind in _MULTIPLICATIVE_KINDS
-            forecasts, actuals = _forecast_matrix_seasonal(
+            forecasts, actuals, _mask = _forecast_matrix_seasonal(
                 self.params_, y_jax, self.h, unpack, self.seasonal_period, multiplicative
             )
         else:
             unpack = _UNPACK_BY_KIND[self._kind]
-            forecasts, actuals = _forecast_matrix(self.params_, y_jax, self.h, unpack)
+            forecasts, actuals, _mask = _forecast_matrix(self.params_, y_jax, self.h, unpack)
         return np.asarray(jnp.std(actuals - forecasts, axis=0))
 
     def predict_interval(
@@ -606,8 +687,18 @@ class HoltWinters(Holt):
             )
 
         loss_key = _loss_key(self.loss, self.delta, self.tau)
-        y_jax = jnp.asarray(y)
-        objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind, m, len(y))
+        custom = callable(loss_key)
+        # Multiplicative seasonal states evolve via y_t/s_old, y_t/level (not a
+        # convex combination like every other kind), so unlike the additive/
+        # non-seasonal recursions -- provably bounded, spectral radius < 1
+        # everywhere in the alpha/beta/(phi) box -- iterating it hundreds of
+        # extra steps on constant padding can blow up toward +-inf/0 well
+        # within float64 range at plausible box-valid multi-start corners
+        # (confirmed by direct simulation). Padding is skipped here; the
+        # bucketing benefit is only safe for the additive/non-seasonal kinds.
+        y_fit = y if (custom or multiplicative) else _pad_to_bucket(y)
+        y_jax = jnp.asarray(y_fit)
+        objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind, m, len(y_fit))
         if multiplicative:
             level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
                 y, m
@@ -628,9 +719,9 @@ class HoltWinters(Holt):
         for start in _start_grid(self.n_starts, self._n_trend_params):
             x0 = np.concatenate([start, [level0_guess, trend0_guess], season0_guess])
             result = minimize(
-                lambda p: float(objective(p, y_jax)),
+                lambda p: float(objective(p, y_jax, len(y))),
                 x0,
-                jac=lambda p: np.asarray(grad(p, y_jax)),
+                jac=lambda p: np.asarray(grad(p, y_jax, len(y))),
                 method="L-BFGS-B",
                 bounds=bounds,
             )
