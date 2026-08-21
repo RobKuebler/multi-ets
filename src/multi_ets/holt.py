@@ -483,6 +483,208 @@ def _start_grid(n_starts: int, n_dims: int = 2) -> list[tuple[float, ...]]:
     return [combos[i] for i in idx]
 
 
+# --- Hand-derived (NumPy, no JAX) fitting path for the non-seasonal kinds ---
+#
+# Replaces jax.grad/jaxopt for SES/Holt/DampedHolt (#18). _loss_value_np and
+# _loss_grad_np are the only pieces that differ per built-in loss (mse/mae/
+# huber/pinball); they're kept recursion-agnostic so #19 (seasonal models)
+# reuses them unchanged for its own d(loss)/d(forecast) step.
+
+
+def _masked_mean_np(x: np.ndarray, mask: np.ndarray | None) -> float:
+    """Mirrors _masked_mean, but plain NumPy."""
+    if mask is None:
+        return float(x.mean())
+    weighted = np.where(mask[:, None], x, 0.0)
+    return float(weighted.sum() / (mask.sum() * x.shape[-1]))
+
+
+def _loss_value_np(
+    loss_key: tuple[str, float, float],
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> float:
+    """loss(y_true, y_pred), for a resolved built-in loss_key (see _loss_key)."""
+    name, delta, tau = loss_key
+    if name == "mse":
+        return _masked_mean_np((y_pred - y_true) ** 2, mask)
+    if name == "mae":
+        return _masked_mean_np(np.abs(y_pred - y_true), mask)
+    if name == "huber":
+        r = y_pred - y_true
+        abs_r = np.abs(r)
+        quadratic = np.minimum(abs_r, delta)
+        linear = abs_r - quadratic
+        return _masked_mean_np(0.5 * quadratic**2 + delta * linear, mask)
+    if name == "pinball":
+        e = y_true - y_pred
+        return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask)
+    raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
+
+
+def _loss_grad_np(
+    loss_key: tuple[str, float, float],
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """d(loss)/d(y_pred), same shape as y_pred, for a resolved built-in loss_key.
+
+    The one piece that changes between loss types; shared by the non-seasonal
+    (here) and seasonal (#19) BPTT passes.
+    """
+    name, delta, tau = loss_key
+    n = (mask.sum() if mask is not None else y_pred.shape[0]) * y_pred.shape[-1]
+    scale = (mask[:, None] if mask is not None else 1.0) / n
+    if name == "mse":
+        g = 2.0 * (y_pred - y_true)
+    elif name == "mae":
+        g = np.sign(y_pred - y_true)
+    elif name == "huber":
+        g = np.clip(y_pred - y_true, -delta, delta)
+    elif name == "pinball":
+        g = np.where(y_true >= y_pred, -tau, 1.0 - tau)
+    else:
+        raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
+    return g * scale
+
+
+def _origin_mask_np(n_origins: int, n_valid: int, h: int) -> np.ndarray:
+    """Mirrors _origin_mask, but plain NumPy (n_valid is never None here)."""
+    return np.arange(n_origins) < (n_valid - h + 1)
+
+
+def _forecast_multiplier_np(phi: float, h: int) -> np.ndarray:
+    """Mirrors _forecast_multiplier, but plain NumPy."""
+    steps = np.arange(1, h + 1)
+    return np.cumsum(phi**steps)
+
+
+def _states_np(
+    alpha: float, beta: float, phi: float, level0: float, trend0: float, y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mirrors _states, but a plain Python/NumPy loop instead of jax.lax.scan."""
+    t_max = len(y)
+    levels = np.empty(t_max + 1)
+    trends = np.empty(t_max + 1)
+    levels[0], trends[0] = level0, trend0
+    for t in range(t_max):
+        level, trend = levels[t], trends[t]
+        new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
+        new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+        levels[t + 1], trends[t + 1] = new_level, new_trend
+    return levels, trends
+
+
+def _holt_forward_np(
+    params: np.ndarray, y: np.ndarray, h: int, kind: str
+) -> tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(alpha, beta, phi, levels, trends, multiplier, forecasts, actuals) for one params guess."""
+    alpha, beta, phi, level0, trend0 = _UNPACK_BY_KIND[kind](params)
+    levels, trends = _states_np(alpha, beta, phi, level0, trend0, y)
+    n_origins = len(y) - h + 1
+    multiplier = _forecast_multiplier_np(phi, h)
+    forecasts = levels[:n_origins, None] + multiplier[None, :] * trends[:n_origins, None]
+    actuals = np.stack([y[t : t + h] for t in range(n_origins)])
+    return alpha, beta, phi, levels, trends, multiplier, forecasts, actuals
+
+
+def _states_bptt_grad_np(
+    alpha: float,
+    beta: float,
+    phi: float,
+    levels: np.ndarray,
+    trends: np.ndarray,
+    y: np.ndarray,
+    d_forecast: np.ndarray,
+    multiplier: np.ndarray,
+    h: int,
+) -> np.ndarray:
+    """Backprop-through-time gradient of the joint loss wrt (alpha, beta, phi, level0, trend0).
+
+    d_forecast is d(loss)/d(forecast) (see _loss_grad_np); levels/trends are
+    _states_np's full output. Mirrors what jax.grad(_joint_loss) computed
+    automatically for the jax path, including the multiplier's own
+    dependence on phi (forecast = level + multiplier(phi) * trend).
+    """
+    n_origins = d_forecast.shape[0]
+    gl_direct = d_forecast.sum(axis=1)
+    gt_direct = d_forecast @ multiplier
+    steps = np.arange(1, h + 1)
+    d_multiplier_d_phi = np.cumsum(steps * phi ** (steps - 1))
+    d_phi = float(np.sum(trends[:n_origins] * (d_forecast @ d_multiplier_d_phi)))
+
+    d_alpha = 0.0
+    d_beta = 0.0
+    gl_next = 0.0
+    gt_next = 0.0
+    for t in range(n_origins - 1, 0, -1):
+        gl_t = gl_direct[t] + gl_next
+        gt_t = gt_direct[t] + gt_next
+        level_prev, trend_prev = levels[t - 1], trends[t - 1]
+        y_prev = y[t - 1]
+        pre_activation = y_prev - level_prev - phi * trend_prev
+
+        d_alpha += (gl_t + beta * gt_t) * pre_activation
+        d_beta += gt_t * (levels[t] - level_prev - phi * trend_prev)
+        d_phi += trend_prev * (gl_t * (1 - alpha) + gt_t * (1 - alpha * beta))
+
+        gl_next = gl_t * (1 - alpha) - gt_t * alpha * beta
+        gt_next = gl_t * (1 - alpha) * phi + gt_t * phi * (1 - alpha * beta)
+
+    d_level0 = gl_direct[0] + gl_next
+    d_trend0 = gt_direct[0] + gt_next
+    return np.array([d_alpha, d_beta, d_phi, d_level0, d_trend0])
+
+
+def _pack_grad_undamped(d: np.ndarray) -> np.ndarray:
+    d_alpha, d_beta, _d_phi, d_level0, d_trend0 = d
+    return np.array([d_alpha, d_beta, d_level0, d_trend0])
+
+
+def _pack_grad_damped(d: np.ndarray) -> np.ndarray:
+    return d
+
+
+def _pack_grad_ses(d: np.ndarray) -> np.ndarray:
+    d_alpha, _d_beta, _d_phi, d_level0, _d_trend0 = d
+    return np.array([d_alpha, d_level0])
+
+
+_PACK_GRAD_BY_KIND = {
+    "undamped": _pack_grad_undamped,
+    "damped": _pack_grad_damped,
+    "ses": _pack_grad_ses,
+}
+
+
+def _holt_objective_and_grad(
+    params: np.ndarray,
+    y: np.ndarray,
+    h: int,
+    kind: str,
+    loss_key: tuple[str, float, float],
+    n_valid: int | None = None,
+) -> tuple[float, np.ndarray]:
+    """(loss, grad) for the plain (non-seasonal) Holt recursion, hand-derived (#18).
+
+    grad has the same length/layout as params (per _UNPACK_BY_KIND[kind]).
+    loss_key must be a resolved built-in key (see _loss_key) -- callers fall
+    back to scipy's own finite-difference jac for custom callables, since
+    those aren't differentiated here.
+    """
+    alpha, beta, phi, levels, trends, multiplier, forecasts, actuals = _holt_forward_np(
+        params, y, h, kind
+    )
+    n_origins = forecasts.shape[0]
+    mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
+    value = _loss_value_np(loss_key, actuals, forecasts, mask)
+    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask)
+    grad5 = _states_bptt_grad_np(alpha, beta, phi, levels, trends, y, d_forecast, multiplier, h)
+    return value, _PACK_GRAD_BY_KIND[kind](grad5)
+
+
 class Holt:
     """Holt's linear trend model (undamped, non-seasonal).
 
@@ -522,21 +724,35 @@ class Holt:
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         custom = callable(loss_key)
         y_fit = y if custom else _pad_to_bucket(y)
-        y_jax = jnp.asarray(y_fit)
-        run_all = _compiled_multistart(self.h, loss_key, self._kind, len(y_fit))
+        n_valid = len(y)
+
+        def objective(p: np.ndarray) -> Any:
+            if custom:
+                # No hand-derived gradient for an arbitrary user loss; scipy's
+                # jac=False below falls back to its own finite-difference
+                # estimate (slower/less precise than the old jax.grad, but
+                # this path no longer imports jax at all -- see #18).
+                *_, forecasts, actuals = _holt_forward_np(p, y_fit, self.h, self._kind)
+                return float(loss_key(actuals, forecasts))
+            return _holt_objective_and_grad(p, y_fit, self.h, self._kind, loss_key, n_valid)
+
         # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
         free_guess = _heuristic_init(y)[: self._n_free_params]
-
-        starts = np.array(_start_grid(self.n_starts, self._n_trend_params))
-        tail = np.tile(free_guess, (len(starts), 1))
-        x0_batch = jnp.asarray(np.concatenate([starts, tail], axis=1))
-        lower = jnp.array([_BOUND_EPS] * self._n_trend_params + [-jnp.inf] * self._n_free_params)
-        upper = jnp.array([1 - _BOUND_EPS] * self._n_trend_params + [jnp.inf] * self._n_free_params)
+        lower = [_BOUND_EPS] * self._n_trend_params + [-np.inf] * self._n_free_params
+        upper = [1 - _BOUND_EPS] * self._n_trend_params + [np.inf] * self._n_free_params
         if self._kind == "damped":
-            upper = upper.at[2].set(_PHI_UPPER)  # phi: cap at the classical damping convention
+            upper[2] = _PHI_UPPER  # phi: cap at the classical damping convention
+        bounds = list(zip(lower, upper, strict=True))
 
-        params_batch, values = run_all(x0_batch, lower, upper, y_jax, len(y))
-        self.params_ = np.asarray(params_batch[jnp.argmin(values)])
+        best = None
+        for start in _start_grid(self.n_starts, self._n_trend_params):
+            x0 = np.concatenate([start, free_guess])
+            result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
+            if best is None or result.fun < best.fun:
+                best = result
+
+        assert best is not None  # _start_grid always yields at least one start
+        self.params_ = best.x
         self._y = y
         return self
 

@@ -1,5 +1,6 @@
 import functools
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -106,6 +107,62 @@ def test_custom_callable_loss_is_used_to_fit():
     forecasts = Holt(h=5, loss=weighted_mse).fit(y).predict()
     expected = y[-1] + 2.0 * np.arange(1, 6)
     np.testing.assert_allclose(forecasts, expected, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "loss_name,delta,tau",
+    [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
+)
+@pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
+def test_hand_derived_grad_matches_jax_autodiff(kind, n_params, loss_name, delta, tau):
+    # #18: Holt.fit()'s hand-derived BPTT gradient (_holt_objective_and_grad)
+    # must agree with the JAX autodiff gradient it replaces, for every
+    # built-in loss and every non-seasonal kind (undamped/damped/ses).
+    rng = np.random.default_rng(0)
+    h = 3
+    y = np.cumsum(rng.normal(0, 1, 20)) + 10
+    unpack = holt_module._UNPACK_BY_KIND[kind]
+    loss_key = (loss_name, delta, tau)
+    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
+
+    p = rng.uniform(0.1, 0.9, n_params)
+    if kind == "damped":
+        p[2] = min(p[2], 0.9)  # phi < 1, matching the classical damping range
+
+    def jax_loss(params):
+        return holt_module._joint_loss(params, jnp.asarray(y), h, loss_fn_jax, unpack)
+
+    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
+    _, grad = holt_module._holt_objective_and_grad(p, y, h, kind, loss_key)
+
+    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
+
+
+def test_hand_derived_grad_matches_jax_autodiff_with_padding():
+    # Holt.fit() always fits on a bucket-padded, masked series (_pad_to_bucket)
+    # -- the branch above never exercises, since it never passes n_valid. That
+    # masked branch is the one every real .fit() call actually uses, so it
+    # needs its own jax-vs-numpy cross-check.
+    rng = np.random.default_rng(1)
+    h = 3
+    y = np.cumsum(rng.normal(0, 1, 13)) + 10  # 13 -> pads to 16
+    y_padded = holt_module._pad_to_bucket(y)
+    assert len(y_padded) > len(y)  # sanity: this length actually needs padding
+    kind = "undamped"
+    unpack = holt_module._UNPACK_BY_KIND[kind]
+    loss_key = ("mse", 1.0, 0.5)
+    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
+    p = rng.uniform(0.1, 0.9, 4)
+
+    def jax_loss(params):
+        return holt_module._joint_loss(
+            params, jnp.asarray(y_padded), h, loss_fn_jax, unpack, n_valid=len(y)
+        )
+
+    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
+    _, grad = holt_module._holt_objective_and_grad(p, y_padded, h, kind, loss_key, n_valid=len(y))
+
+    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
 
 
 def test_unknown_loss_raises():
@@ -384,18 +441,22 @@ def test_compiled_multistart_cache_stays_bounded_across_many_lengths(monkeypatch
     # rolling-origin backtest does) must not grow the compiled-closure cache
     # without bound -- each length beyond the cache's maxsize should evict an
     # older one rather than accumulate forever. Swaps in a maxsize=2 cache
-    # (same underlying builder, same real .fit() code path) so the eviction
-    # behavior can be proven with a handful of real compiles instead of
-    # _COMPILE_CACHE_SIZE + 1 of them.
+    # (same underlying builder) so the eviction behavior can be proven with a
+    # handful of real compiles instead of _COMPILE_CACHE_SIZE + 1 of them.
+    #
+    # Calls _compiled_multistart directly rather than through SES.fit(): as of
+    # #18, nothing in this module calls this JAX-jaxopt cache any more (it's
+    # fully dead code, left in place until #20 deletes it); this test still
+    # exercises the cache's own eviction behavior, which is otherwise untested.
     def _build(h, loss_key, kind, n):  # mirrors _compiled_multistart_cached's signature
         return holt_module._compile_multistart(h, loss_key, kind)
 
     small_cache = functools.lru_cache(maxsize=2)(_build)
     monkeypatch.setattr(holt_module, "_compiled_multistart_cached", small_cache)
 
+    loss_key = holt_module._loss_key("mse", 1.0, 0.5)
     for length in range(5, 9):  # 4 distinct lengths through a maxsize=2 cache
-        y = np.linspace(0, 1, length)
-        SES(h=1, n_starts=1).fit(y)
+        holt_module._compiled_multistart(1, loss_key, "ses", length)
 
     assert small_cache.cache_info().currsize <= 2
 
@@ -443,15 +504,23 @@ def test_expanding_window_refits_share_one_compiled_shape(monkeypatch):
     # within one backtest. Bucketing to the next power of two means every
     # length in [5, 8] now shares bucket 8, so this cache should see the same
     # single entry hit on every refit after the first.
+    #
+    # Simulates the bucketing + cache lookup directly rather than through
+    # SES.fit(): as of #18, SES/Holt/DampedHolt no longer pass a bucketed
+    # length into this JAX-jaxopt cache themselves (it's dead code from their
+    # side now, kept alive only until #20 deletes it); this test still
+    # exercises the cache's own bucket-sharing behavior, which is otherwise
+    # untested.
     def _build(h, loss_key, kind, n):  # mirrors _compiled_multistart_cached's signature
         return holt_module._compile_multistart(h, loss_key, kind)
 
     small_cache = functools.lru_cache(maxsize=2)(_build)
     monkeypatch.setattr(holt_module, "_compiled_multistart_cached", small_cache)
 
+    loss_key = holt_module._loss_key("mse", 1.0, 0.5)
     for length in range(5, 9):  # expanding window: 5, 6, 7, 8
-        y = np.linspace(0, 1, length)
-        SES(h=1, n_starts=1).fit(y)
+        bucket_len = len(holt_module._pad_to_bucket(np.linspace(0, 1, length)))
+        holt_module._compiled_multistart(1, loss_key, "ses", bucket_len)
 
     assert small_cache.cache_info().hits >= 3  # only the first length misses
     assert small_cache.cache_info().currsize == 1
