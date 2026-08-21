@@ -1,9 +1,12 @@
+import functools
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from statsmodels.tsa.holtwinters import Holt as SMHolt
 
 from multi_ets import SES, DampedHolt, DampedHoltWinters, Holt, HoltWinters
+from multi_ets import holt as holt_module
 
 
 def test_predict_returns_h_forecasts():
@@ -374,3 +377,24 @@ def test_attribute_set_after_construction_is_honored_at_fit():
 
     direct = Holt(h=5, loss="huber", delta=20.0).fit(y)
     np.testing.assert_allclose(model.params_, direct.params_)
+
+
+def test_compiled_multistart_cache_stays_bounded_across_many_lengths(monkeypatch):
+    # Regression test for #15: fitting many distinct training lengths (as a
+    # rolling-origin backtest does) must not grow the compiled-closure cache
+    # without bound -- each length beyond the cache's maxsize should evict an
+    # older one rather than accumulate forever. Swaps in a maxsize=2 cache
+    # (same underlying builder, same real .fit() code path) so the eviction
+    # behavior can be proven with a handful of real compiles instead of
+    # _COMPILE_CACHE_SIZE + 1 of them.
+    def _build(h, loss_key, kind, n):  # mirrors _compiled_multistart_cached's signature
+        return holt_module._compile_multistart(h, loss_key, kind)
+
+    small_cache = functools.lru_cache(maxsize=2)(_build)
+    monkeypatch.setattr(holt_module, "_compiled_multistart_cached", small_cache)
+
+    for length in range(5, 9):  # 4 distinct lengths through a maxsize=2 cache
+        y = np.linspace(0, 1, length)
+        SES(h=1, n_starts=1).fit(y)
+
+    assert small_cache.cache_info().currsize <= 2

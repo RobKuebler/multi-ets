@@ -32,6 +32,14 @@ _PHI_UPPER = 0.98
 # different, matching scipy's original multi-start behavior.
 _LBFGSB_MAXITER = 20
 _LBFGSB_TOL = 1e-6
+# ponytail: caps how many distinct training-array lengths' worth of compiled
+# JIT closures (#15) are kept alive per (h, loss, kind[, m]) combo. Each
+# closure owns its own uncapped internal XLA per-shape cache, so reusing one
+# closure across many lengths (e.g. rolling-origin backtests) grew memory
+# without bound; bounding the outer cache lets old-length closures get
+# evicted and garbage-collected instead. Raise this if a workload legitimately
+# cycles through more distinct shapes than it revisits.
+_COMPILE_CACHE_SIZE = 16
 
 
 def _huber(residual: Any, delta: float) -> Array:
@@ -262,15 +270,15 @@ def _compile_objective_and_grad(
     return jax.jit(objective), jax.jit(jax.grad(objective))
 
 
-@functools.cache
+@functools.lru_cache(maxsize=_COMPILE_CACHE_SIZE)
 def _compiled_objective_and_grad_cached(
-    h: int, loss_key: Any, kind: str, m: int | None = None
+    h: int, loss_key: Any, kind: str, m: int | None, n: int
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
     return _compile_objective_and_grad(h, loss_key, kind, m)
 
 
 def _compiled_objective_and_grad(
-    h: int, loss_key: Any, kind: str, m: int | None = None
+    h: int, loss_key: Any, kind: str, m: int | None, n: int
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
     """JIT-compiled (objective, grad) for a given (h, loss, kind, m), reused across fits.
 
@@ -279,13 +287,18 @@ def _compiled_objective_and_grad(
     the same (h, loss, kind, m) instead of recompiling from scratch every call.
     m (seasonal_period) is unused for non-seasonal kinds.
 
+    n (the training array length) is a cache-key-only dimension, not used in
+    the body: it forces a fresh, independently-evictable closure per distinct
+    length instead of growing one closure's internal per-shape cache forever
+    across every length ever seen (#15) -- see _COMPILE_CACHE_SIZE.
+
     Custom callables bypass the cache: keying on them would pin every
     distinct callable (and its closed-over data) in this module-level cache
     for the life of the process.
     """
     if callable(loss_key):
         return _compile_objective_and_grad(h, loss_key, kind, m)
-    return _compiled_objective_and_grad_cached(h, loss_key, kind, m)
+    return _compiled_objective_and_grad_cached(h, loss_key, kind, m, n)
 
 
 def _compile_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
@@ -295,23 +308,21 @@ def _compile_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     autodiff/compile work is identical to before; only the restart loop moves
     from sequential scipy calls into a single jax.vmap'd solver.run.
 
-    Known failure mode (issue #15): a fresh (h, loss, kind) x training-length
-    shape here triggers a full XLA (re)compile of this jax.jit(jax.vmap(...))
-    graph, and #15 reported that compile occasionally never finishing / memory
-    growing without bound on CPU, for series lengths that never arise during
-    backtesting (e.g. an untruncated 150- or 400-point series). Investigated
-    for #15 by bisecting the exact reported shapes (h=6, n_starts=10, default
-    maxiter, lengths 20/48/80/100/120/150/400) plus the full run_jit_footnote()
-    reproduction from benchmarks/: none reproduced (jax 0.11.0, jaxopt 0.8.5,
-    Python 3.12; all finished in single-digit seconds). No fixable bug was
-    found in this module's code, and jaxopt has no release past 0.8.5 to pin
-    against, so this looks like an environment- or jax/jaxopt-version-
-    dependent characteristic of vmap(LBFGSB.run), not a bug introduced here.
-    If it recurs: a wall-clock guard around this call (e.g. a persistent
-    spawn-context ProcessPoolExecutor, so a runaway compile can actually be
-    killed -- plain threads can't be) is the suggested fix, but it adds enough
-    complexity/latency that it wasn't worth doing speculatively without a
-    reproduction to validate it against.
+    Root cause of issue #15: a single call here builds one jax.jit(jax.vmap(...))
+    closure that's reused, via the module-level cache below, across every
+    later call sharing the same (h, loss, kind) -- including calls with a
+    *different* training-array length. Each new length triggers a fresh XLA
+    compile that jax caches internally *inside that one closure*, forever,
+    with no eviction; a rolling-origin backtest (a different length per fold)
+    accumulates one such compile per fold for the life of the process, which
+    is exactly the unbounded, roughly-linear memory growth #15 reported (confirmed:
+    the real repro, `uv run python -m benchmarks.run_comparison`, OOM-killed
+    under a 3G cgroup cap after ~4 minutes). Isolated single-shape .fit() calls
+    don't show this, since they only ever produce one compile -- that's why
+    they don't reproduce it. Fixed by including the training length in the
+    cache key one level up (_compiled_multistart_cached), so each distinct
+    length gets its own closure that can be evicted and garbage-collected
+    instead of accumulating inside a single unbounded one.
     """
     objective, grad = _compile_objective_and_grad(h, loss_key, kind)
     solver = jaxopt.LBFGSB(
@@ -331,19 +342,22 @@ def _compile_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
     return jax.jit(run_all)
 
 
-@functools.cache
-def _compiled_multistart_cached(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
+@functools.lru_cache(maxsize=_COMPILE_CACHE_SIZE)
+def _compiled_multistart_cached(h: int, loss_key: Any, kind: str, n: int) -> Callable[..., Any]:
     return _compile_multistart(h, loss_key, kind)
 
 
-def _compiled_multistart(h: int, loss_key: Any, kind: str) -> Callable[..., Any]:
+def _compiled_multistart(h: int, loss_key: Any, kind: str, n: int) -> Callable[..., Any]:
     """JIT-compiled vmapped multi-start solver for (h, loss, kind), reused across fits.
+
+    n (the training array length) is a cache-key-only dimension -- see
+    _compiled_objective_and_grad's matching parameter and _COMPILE_CACHE_SIZE.
 
     Mirrors _compiled_objective_and_grad's cache-bypass for custom callables.
     """
     if callable(loss_key):
         return _compile_multistart(h, loss_key, kind)
-    return _compiled_multistart_cached(h, loss_key, kind)
+    return _compiled_multistart_cached(h, loss_key, kind, n)
 
 
 def _heuristic_init(y: Any) -> tuple[float, float]:
@@ -428,7 +442,7 @@ class Holt:
 
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         y_jax = jnp.asarray(y)
-        run_all = _compiled_multistart(self.h, loss_key, self._kind)
+        run_all = _compiled_multistart(self.h, loss_key, self._kind, len(y))
         # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
         free_guess = _heuristic_init(y)[: self._n_free_params]
 
@@ -593,7 +607,7 @@ class HoltWinters(Holt):
 
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         y_jax = jnp.asarray(y)
-        objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind, m)
+        objective, grad = _compiled_objective_and_grad(self.h, loss_key, self._kind, m, len(y))
         if multiplicative:
             level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
                 y, m
