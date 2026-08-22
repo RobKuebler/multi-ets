@@ -68,3 +68,9 @@ addopts = "--cov=multi_ets --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["src/multi_ets"]
+
+[tool.ty.src]
+# setup.py imports Cython/setuptools, which are only installed under the
+# optional `[fast]` extra (see docs/adr/0002) -- the plain `dev` group ty
+# runs under (pre-commit, CI) can't resolve them.
+exclude = ["src/multi_ets/setup.py"]
