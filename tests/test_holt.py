@@ -96,6 +96,18 @@ def test_pinball_tau_orders_forecasts():
     assert np.all(high_tau.predict() >= low_tau.predict())
 
 
+def test_expectile_tau_orders_forecasts():
+    h = 3
+    rng = np.random.default_rng(3)
+    y = 5.0 + 1.5 * np.arange(40) + rng.normal(0, 1.5, 40)
+
+    mid_tau = Holt(h=h, loss="expectile", tau=0.5, n_starts=8).fit(y)
+    low_tau = Holt(h=h, loss="expectile", tau=0.1, n_starts=8).fit(y)
+    high_tau = Holt(h=h, loss="expectile", tau=0.9, n_starts=8).fit(y)
+    assert np.all(high_tau.predict() >= mid_tau.predict())
+    assert np.all(mid_tau.predict() >= low_tau.predict())
+
+
 def test_custom_callable_loss_is_used_to_fit():
     def weighted_mse(y_true, y_pred):
         return np.mean((y_pred - y_true) ** 2)
@@ -116,6 +128,7 @@ def test_custom_callable_loss_is_used_to_fit():
         ("poisson", 1.0, 0.5),
         ("negbinom", 1.0, 0.5),
         ("tweedie", 1.0, 0.5),
+        ("expectile", 1.0, 0.3),
     ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
@@ -188,6 +201,7 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
         ("poisson", 1.0, 0.5),
         ("negbinom", 1.0, 0.5),
         ("tweedie", 1.0, 0.5),
+        ("expectile", 1.0, 0.3),
     ],
 )
 @pytest.mark.parametrize(
@@ -293,6 +307,11 @@ def test_poisson_loss_gives_lower_poisson_deviance_than_mse():
         return holt_module._loss_value_np(poisson_loss_key, actuals, forecasts)
 
     assert poisson_deviance(poisson_fit) < poisson_deviance(mse_fit)
+
+
+def test_out_of_range_expectile_tau_raises():
+    with pytest.raises(ValueError, match="tau must be in"):
+        Holt(h=3, loss="expectile", tau=1.5)
 
 
 def test_damped_predict_returns_h_forecasts():
@@ -561,6 +580,7 @@ def test_attribute_set_after_construction_is_honored_at_fit():
         ("poisson", {}),
         ("negbinom", {"alpha": 2.0}),
         ("tweedie", {"p": 1.3}),
+        ("expectile", {"tau": 0.3}),
     ],
 )
 def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):

@@ -271,6 +271,9 @@ def _loss_value_np(
             + mu ** (2 - p) / (2 - p)
         )
         return _masked_mean_np(dev, mask, weight)
+    if name == "expectile":
+        w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
+        return _masked_mean_np(w_asym * (y_true - y_pred) ** 2, mask, weight)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -306,6 +309,9 @@ def _loss_grad_np(
         p = loss_key[4]
         mu = np.maximum(y_pred, _BOUND_EPS)
         g = np.where(y_pred > _BOUND_EPS, 2.0 * mu ** (-p) * (mu - y_true), 0.0)
+    elif name == "expectile":
+        w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
+        g = 2.0 * w_asym * (y_pred - y_true)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
     w = _full_weight(y_pred.shape, mask, weight)
