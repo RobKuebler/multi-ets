@@ -6,6 +6,40 @@ Most ETS implementations fit `alpha`/`beta`/`gamma`/... to minimize one-step-ahe
 
 Fit with hand-derived gradients and multi-start [L-BFGS-B](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-lbfgsb.html) (via `scipy.optimize.minimize`) to deal with the resulting loss surface's local optima.
 
+## Why multi-ets?
+
+statsmodels and statsforecast are solid classical/innovations ETS implementations, but their fitting is rigid: one fixed loss (SSE or Gaussian MLE), and no real answer for missing data. `multi_ets` differs on exactly those two points, and is at least competitive on plain forecast accuracy.
+
+**Missing values.** `multi_ets` skips NaN steps in the state recursion and zero-weights them out of the loss, instead of failing or silently propagating garbage:
+
+```
+=== Missing values (2 NaNs in a 20-point series) ===
+multi_ets:     [145.00701916 146.36080822 147.71459728]
+statsmodels:   [nan nan nan]  (fits without error, but forecast is all-NaN)
+statsforecast: raises Exception: no model able to be fitted
+```
+
+statsmodels *looks* like it succeeded -- `.fit()` raises nothing -- but the forecast is silently all-NaN. statsforecast fails outright. Neither offers a way to just handle the gap. (`uv run python -m benchmarks.capability_demo`)
+
+**Loss functions.** All 9 built-in losses (`mse`, `mae`, `huber`, `pinball`, `expectile`, `logcosh`, `poisson`, `negbinom`, `tweedie`), or any custom callable, apply to every model. statsmodels and statsforecast don't expose a loss choice at all -- you get SSE (classical) or Gaussian MLE (innovations), period. That matters whenever the default isn't the right objective, e.g. an outlier-robust fit:
+
+```
+=== Loss choice on a series with one outlier ===
+(ground truth for the first forecast step is ~130.0)
+multi_ets (mse         ): [135.01093768 135.62232229 136.2337069  136.84509151 137.45647612]
+multi_ets (huber delta=5): [131.34230083 131.87624212 132.41018341 132.9441247  133.47806599]
+statsmodels/statsforecast: no loss parameter -- always fit by SSE/MLE.
+```
+
+The `huber` fit lands closer to the true continuation because the outlier no longer dominates the loss the way it does under plain `mse`.
+
+**Forecast accuracy and fit time.** On a matched-structure rolling-origin backtest (4 real + 10 synthetic series, `h` in `{1, 6, 12}`, see `docs/adr/0003-batch-vs-one-step-ahead-fitting.md` and `benchmarks/run_model_comparison.py`), the joint multi-step loss beats statsmodels' classical one-step fit on MSE in 70% of h=6/h=12 cases (median MSE ratio 0.989), and comes out ahead by MASE more often than any single alternative (multi_ets 12/27, statsforecast 9/27, statsmodels 5/27). Median fit time is 0.077s vs. statsmodels' 0.120s; statsforecast is fastest at 0.017s (numba-jitted) but that speed comes with no loss choice and no missing-value support. None of this is a landslide in either direction -- `multi_ets` loses on some structures (e.g. `real_gdp` at longer horizons, documented in the ADR) -- but it's a real edge, not just a different API for the same fit.
+
+```bash
+uv run python -m benchmarks.run_model_comparison   # regenerate the numbers above
+uv run python -m benchmarks.capability_demo         # regenerate the snippets above
+```
+
 ## Install
 
 ```bash
@@ -15,27 +49,35 @@ uv add multi-ets   # or: pip install multi-ets
 ## Usage
 
 ```python
-from multi_ets import SES, Holt, DampedHolt, HoltWinters, DampedHoltWinters
+from multi_ets import ExponentialSmoothing
 
-# Flat forecast, no trend.
-forecasts = SES(h=5).fit(y).predict()
+# Flat forecast, no trend, no seasonality.
+forecasts = ExponentialSmoothing(h=5).fit(y).predict()
 
 # Plain linear trend, forecast 5 steps ahead.
-forecasts = Holt(h=5).fit(y).predict()
+forecasts = ExponentialSmoothing(h=5, trend="add").fit(y).predict()
 
 # Damped trend (phi jointly optimized, box-constrained to (0, 1)).
-forecasts = DampedHolt(h=5).fit(y).predict()
+forecasts = ExponentialSmoothing(h=5, trend="damped").fit(y).predict()
 
-# Additive seasonality, period 12 (e.g. monthly data).
-forecasts = HoltWinters(h=5, seasonal_period=12).fit(y).predict()
+# Additive seasonality, period 12 (e.g. monthly data), with a linear trend.
+forecasts = ExponentialSmoothing(h=5, trend="add", seasonal_period=12).fit(y).predict()
+
+# Seasonality with no trend term at all.
+forecasts = ExponentialSmoothing(h=5, seasonal_period=12).fit(y).predict()
 
 # Multiplicative seasonality, with a damped trend.
 forecasts = (
-    DampedHoltWinters(h=5, seasonal_period=12, seasonal_type="multiplicative").fit(y).predict()
+    ExponentialSmoothing(h=5, trend="damped", seasonal_period=12, seasonal_type="multiplicative")
+    .fit(y)
+    .predict()
 )
 ```
 
-Every model exposes just `.fit(y)` / `.predict()`. Fitted parameters are in `.params_` after `fit()`.
+`trend` is `None` (default, no trend), `"add"`, or `"damped"`; `seasonal_period` (default `None`)
+adds an `"additive"` or `"multiplicative"` (`seasonal_type`) seasonal component on top of either
+trend, or on top of no trend at all. Every combination exposes just `.fit(y)` / `.predict()`;
+fitted parameters are in `.params_` after `fit()`.
 
 ### Prediction intervals
 
@@ -43,10 +85,10 @@ Every model exposes `.predict_interval(coverage=0.9)` after fitting, returning a
 per-horizon-step Gaussian interval built from residuals of the fitted joint loss:
 
 ```python
-lower, upper = Holt(h=5).fit(y).predict_interval(coverage=0.9)
+lower, upper = ExponentialSmoothing(h=5, trend="add").fit(y).predict_interval(coverage=0.9)
 
 # A list of coverages returns a {coverage: (lower, upper)} dict instead.
-intervals = Holt(h=5).fit(y).predict_interval(coverage=[0.5, 0.9])
+intervals = ExponentialSmoothing(h=5, trend="add").fit(y).predict_interval(coverage=[0.5, 0.9])
 ```
 
 ### Model selection
@@ -55,17 +97,35 @@ intervals = Holt(h=5).fit(y).predict_interval(coverage=[0.5, 0.9])
 cross-validation, scoring each with its own `loss`/`h`:
 
 ```python
-from multi_ets import select_model
+from multi_ets import ExponentialSmoothing, select_model
 
 candidates = [
-    SES(h=5, loss="mae"),
-    HoltWinters(h=5, seasonal_period=12, loss="mae"),
+    ExponentialSmoothing(h=5, loss="mae"),
+    ExponentialSmoothing(h=5, trend="add", seasonal_period=12, loss="mae"),
 ]
 best, scores = select_model(candidates, y, n_splits=3)
 forecasts = best.predict()
 ```
 
 `best` is refit on the full series; `scores` maps each candidate to its mean CV loss.
+
+`AutoExponentialSmoothing` builds that candidate grid for you -- every valid `trend` x
+`seasonal_type` combination at a given `seasonal_period` (or just the three `trend` options with
+no seasonal candidates when `seasonal_period` is omitted) -- and picks the best the same way:
+
+```python
+from multi_ets import AutoExponentialSmoothing
+
+model = AutoExponentialSmoothing(h=5, seasonal_period=12, loss="mae").fit(y)
+forecasts = model.predict()
+model.best_     # the winning fitted ExponentialSmoothing
+model.scores_   # {candidate: mean_cv_loss}
+```
+
+It's named `AutoExponentialSmoothing` rather than `AutoETS`: `AutoETS` is statsforecast's name for
+an *innovations*-based (MLE) auto-selector -- a structurally different fitting philosophy (see
+CONTEXT.md's "Innovations ETS" glossary entry) -- and this repo's own benchmarks compare against
+it directly.
 
 ### Loss
 
@@ -75,9 +135,9 @@ All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delt
 plain NumPy. `poisson`/`negbinom`/`tweedie` require a non-negative `y`.
 
 ```python
-Holt(h=5, loss="huber", delta=2.0).fit(y).predict()
-Holt(h=5, loss="tweedie", p=1.3).fit(y).predict()
-Holt(h=5, loss=lambda yt, yp: (yt - yp).var()).fit(y).predict()
+ExponentialSmoothing(h=5, trend="add", loss="huber", delta=2.0).fit(y).predict()
+ExponentialSmoothing(h=5, trend="add", loss="tweedie", p=1.3).fit(y).predict()
+ExponentialSmoothing(h=5, trend="add", loss=lambda yt, yp: (yt - yp).var()).fit(y).predict()
 ```
 
 ### Multi-start
@@ -107,19 +167,26 @@ boilerplate.
 
 ## Model overview
 
-| Class | Trend | Seasonality |
+A single `ExponentialSmoothing(h, trend, seasonal_period, seasonal_type, ...)` class covers every
+configuration below; the `trend`/`seasonal_period`/`seasonal_type` kwargs pick the configuration
+(see `docs/adr/0004-consolidate-model-classes.md` for why this replaced one class per
+configuration):
+
+| `trend` | `seasonal_period` | Configuration |
 |---|---|---|
-| `SES` | — | — |
-| `Holt` | linear | — |
-| `DampedHolt` | damped (`phi` fit jointly) | — |
-| `HoltWinters` | linear | additive or multiplicative (`seasonal_type`) |
-| `DampedHoltWinters` | damped | additive or multiplicative |
+| `None` | `None` | flat forecast, no trend, no seasonality (simple exponential smoothing) |
+| `"add"` | `None` | linear trend |
+| `"damped"` | `None` | damped trend, `phi` fit jointly |
+| `None` | set | seasonal only, additive or multiplicative (`seasonal_type`), no trend |
+| `"add"` | set | linear trend + seasonal, additive or multiplicative |
+| `"damped"` | set | damped trend + seasonal, additive or multiplicative |
 
 ## Development
 
 ```bash
 uv run pytest tests/ -q
-uv run python examples/benchmark.py   # accuracy/speed vs. statsmodels on real datasets
+uv run python examples/benchmark.py       # accuracy/speed vs. statsmodels on real datasets
+uv run python -m benchmarks.capability_demo   # missing-value / loss-choice demo (see "Why multi-ets?")
 
 uv run pre-commit install   # once, to run lint/format/type checks on every commit
 uv run pre-commit run --all-files
