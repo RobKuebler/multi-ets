@@ -825,6 +825,20 @@ def test_sample_weight_all_zero_raises():
         ExponentialSmoothing(trend="add", h=3, loss="mse").fit(y, sample_weight=np.zeros(20))
 
 
+def test_sample_weight_that_only_covers_a_nan_gap_raises():
+    # Passes _resolve_sample_weight's upfront check (weight.sum() > 0), but
+    # every bit of positive weight lands on the one NaN actual -- so after
+    # NaN-masking, the effective total weight is 0. Must raise a clear error
+    # instead of silently returning a NaN loss/gradient (code review finding
+    # on #39: this is reachable through both the NumPy and compiled paths).
+    y = np.array([5.0, 3.0, np.nan])
+    sample_weight = np.array([0.0, 0.0, 1.0])
+    with pytest.raises(ValueError, match="no positive-weight"):
+        ExponentialSmoothing(trend="add", h=1, n_starts=2, loss="mse").fit(
+            y, sample_weight=sample_weight
+        )
+
+
 def test_weight_matrix_aligns_with_actuals_construction():
     # weight[t, k] must line up with actuals's np.stack([y[t:t+h] ...]) layout,
     # so an observation is weighted the same in every origin window it falls

@@ -206,6 +206,11 @@ def objective_and_grad(
             loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
             d_forecast[t, k] = w * g
             weight_sum += w
+    if weight_sum <= 0:  # #25/#35/#39: sample_weight/NaN combo zeroed every valid cell
+        raise ValueError(
+            "no positive-weight, non-missing observations to compute the loss from -- "
+            "check for sample_weight/NaN combinations that zero out every valid cell"
+        )
     loss /= weight_sum
     for t in range(n_origins):
         for k in range(h):
@@ -371,6 +376,11 @@ def seasonal_objective_and_grad(
                 mult_sum += g * d_multiplier_dphi[k]
         d_phi += trends[t] * mult_sum
 
+    if weight_sum <= 0:  # #25/#36/#39: sample_weight/NaN combo zeroed every valid cell
+        raise ValueError(
+            "no positive-weight, non-missing observations to compute the loss from -- "
+            "check for sample_weight/NaN combinations that zero out every valid cell"
+        )
     loss /= weight_sum
     for t in range(n_origins):
         gl_direct[t] /= weight_sum

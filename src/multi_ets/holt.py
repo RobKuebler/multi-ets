@@ -302,6 +302,22 @@ def _nan_actual_mask(actuals: np.ndarray) -> np.ndarray | None:
     return ~is_nan if is_nan.any() else None
 
 
+def _total_weight(w: np.ndarray) -> float:
+    """w.sum(), guarded: a zero total would silently turn the loss/grad into NaN (#25/#33/#34).
+
+    Reachable when sample_weight and/or a NaN-actual gap between them zero out
+    every cell that would otherwise count, e.g. recency weighting decaying the
+    only non-NaN observations to ~0.
+    """
+    total = float(w.sum())
+    if total <= 0:
+        raise ValueError(
+            "no positive-weight, non-missing observations to compute the loss from -- "
+            "check for sample_weight/NaN combinations that zero out every valid cell"
+        )
+    return total
+
+
 def _masked_mean_np(
     x: np.ndarray,
     mask: np.ndarray | None,
@@ -312,7 +328,7 @@ def _masked_mean_np(
     w = _full_weight(x.shape, mask, weight, actual_mask)
     if w is None:
         return float(x.mean())
-    return float(_weighted_zero_safe(x, w).sum() / w.sum())
+    return float(_weighted_zero_safe(x, w).sum() / _total_weight(w))
 
 
 def _loss_value_np(
@@ -419,7 +435,7 @@ def _loss_grad_np(
     w = _full_weight(y_pred.shape, mask, weight, actual_mask)
     if w is None:
         return g / (y_pred.shape[0] * y_pred.shape[-1])
-    return _weighted_zero_safe(g, w) / w.sum()
+    return _weighted_zero_safe(g, w) / _total_weight(w)
 
 
 def _origin_mask_np(n_origins: int, n_valid: int, h: int) -> np.ndarray:
@@ -1041,6 +1057,7 @@ class ExponentialSmoothing:
 
         n_trend = _N_TREND_PARAMS[self._kind]
         n_free = _N_FREE_PARAMS[self._kind]
+        season0_guess: Any = []  # non-seasonal: nothing to append after free_guess
         if seasonal:
             if multiplicative:
                 level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
@@ -1056,13 +1073,6 @@ class ExponentialSmoothing:
             )
             if self._kind.startswith("damped"):
                 bounds[2] = (_BOUND_EPS, _PHI_UPPER)  # phi: cap at the classical damping convention
-
-            best = None
-            for start in _start_grid(self.n_starts, n_trend):
-                x0 = np.concatenate([start, free_guess, season0_guess])
-                result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
-                if best is None or result.fun < best.fun:
-                    best = result
         else:
             free_guess = _heuristic_init(y)[:n_free]
             lower = [_BOUND_EPS] * n_trend + [-np.inf] * n_free
@@ -1071,12 +1081,12 @@ class ExponentialSmoothing:
                 upper[2] = _PHI_UPPER  # phi: cap at the classical damping convention
             bounds = list(zip(lower, upper, strict=True))
 
-            best = None
-            for start in _start_grid(self.n_starts, n_trend):
-                x0 = np.concatenate([start, free_guess])
-                result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
-                if best is None or result.fun < best.fun:
-                    best = result
+        best = None
+        for start in _start_grid(self.n_starts, n_trend):
+            x0 = np.concatenate([start, free_guess, season0_guess])
+            result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
+            if best is None or result.fun < best.fun:
+                best = result
 
         assert best is not None  # _start_grid always yields at least one start
         self.params_ = best.x
