@@ -114,6 +114,7 @@ def test_custom_callable_loss_is_used_to_fit():
         ("huber", 0.7, 0.5),
         ("pinball", 1.0, 0.3),
         ("poisson", 1.0, 0.5),
+        ("negbinom", 1.0, 0.5),
     ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
@@ -184,6 +185,7 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
         ("huber", 0.7, 0.5),
         ("pinball", 1.0, 0.3),
         ("poisson", 1.0, 0.5),
+        ("negbinom", 1.0, 0.5),
     ],
 )
 @pytest.mark.parametrize(
@@ -555,6 +557,7 @@ def test_attribute_set_after_construction_is_honored_at_fit():
         ("huber", {"delta": 0.8}),
         ("pinball", {"tau": 0.4}),
         ("poisson", {}),
+        ("negbinom", {"alpha": 2.0}),
     ],
 )
 def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):
@@ -671,3 +674,73 @@ def test_sample_weight_downweighting_outlier_improves_fit():
     err_unweighted = np.abs(unweighted.predict() - clean_forecast).mean()
     err_weighted = np.abs(weighted.predict() - clean_forecast).mean()
     assert err_weighted < err_unweighted
+
+
+def test_negbinom_smoke_fits_for_all_model_kinds():
+    # #27: negbinom must be usable end to end (not just differentiable) by
+    # every non-seasonal and seasonal model kind.
+    rng = np.random.default_rng(9)
+    y = rng.poisson(10, size=30).astype(float)
+
+    assert Holt(h=3, loss="negbinom", alpha=1.0).fit(y).predict().shape == (3,)
+    assert SES(h=3, loss="negbinom", alpha=1.0).fit(y).predict().shape == (3,)
+    assert DampedHolt(h=3, loss="negbinom", alpha=1.0).fit(y).predict().shape == (3,)
+
+    y_seasonal = rng.poisson(10, size=40).astype(float)
+    forecasts = (
+        HoltWinters(h=3, seasonal_period=4, loss="negbinom", alpha=1.0).fit(y_seasonal).predict()
+    )
+    assert forecasts.shape == (3,)
+
+
+def test_non_positive_negbinom_alpha_raises():
+    with pytest.raises(ValueError, match="alpha"):
+        Holt(h=3, loss="negbinom", alpha=0.0)
+    with pytest.raises(ValueError, match="alpha"):
+        Holt(h=3, loss="negbinom", alpha=-1.0)
+
+
+def test_negbinom_negative_y_raises():
+    y = np.array([1.0, 2.0, -1.0, 3.0, 4.0, 5.0])
+    with pytest.raises(ValueError, match="non-negative"):
+        Holt(h=2, loss="negbinom", alpha=1.0).fit(y)
+
+
+def test_negbinom_achieves_lower_negbinom_deviance_than_poisson_on_overdispersed_counts():
+    # Overdispersed count series (variance well above the mean): a model
+    # fit by minimizing Poisson deviance (which assumes variance == mean)
+    # gets pulled differently by the extra variance than one that accounts
+    # for it via negbinom's alpha, so under negbinom's own deviance the
+    # negbinom-fit model should score better. loss="poisson" isn't
+    # implemented in this worktree yet (#26, sibling issue), so the
+    # comparison model is fit against the documented Poisson deviance
+    # formula directly, via a custom callable loss.
+    rng = np.random.default_rng(8)
+    h = 3
+    mu, alpha_true = 30.0, 0.3
+    p = 1.0 / (1.0 + alpha_true * mu)
+    n = mu * p / (1.0 - p)
+    y = rng.negative_binomial(n, p, size=40).astype(float)
+
+    def poisson_deviance(y_true, y_pred):
+        mu_pred = np.maximum(y_pred, holt_module._BOUND_EPS)
+        dev = 2.0 * (
+            np.where(y_true > 0, y_true * np.log(y_true / mu_pred), 0.0) - (y_true - mu_pred)
+        )
+        return dev.mean()
+
+    negbinom_fit = Holt(h=h, loss="negbinom", alpha=alpha_true, n_starts=5).fit(y)
+    poisson_fit = Holt(h=h, loss=poisson_deviance, n_starts=5).fit(y)
+
+    *_, forecasts_nb, actuals_nb = holt_module._holt_forward_np(
+        negbinom_fit.params_, y, h, negbinom_fit._kind
+    )
+    *_, forecasts_pois, actuals_pois = holt_module._holt_forward_np(
+        poisson_fit.params_, y, h, poisson_fit._kind
+    )
+
+    loss_key = ("negbinom", 1.0, 0.5, alpha_true, 1.5)
+    dev_nb = holt_module._loss_value_np(loss_key, actuals_nb, forecasts_nb)
+    dev_pois = holt_module._loss_value_np(loss_key, actuals_pois, forecasts_pois)
+
+    assert dev_nb < dev_pois

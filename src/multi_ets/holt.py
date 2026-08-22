@@ -254,6 +254,14 @@ def _loss_value_np(
         mu = np.maximum(y_pred, _BOUND_EPS)
         dev = 2.0 * (np.where(y_true > 0, y_true * np.log(y_true / mu), 0.0) - (y_true - mu))
         return _masked_mean_np(dev, mask, weight)
+    if name == "negbinom":
+        alpha = loss_key[3]
+        mu = np.maximum(y_pred, _BOUND_EPS)
+        dev = 2.0 * (
+            np.where(y_true > 0, y_true * np.log(y_true / mu), 0.0)
+            - (y_true + 1.0 / alpha) * np.log((1.0 + alpha * y_true) / (1.0 + alpha * mu))
+        )
+        return _masked_mean_np(dev, mask, weight)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -281,6 +289,10 @@ def _loss_grad_np(
     elif name == "poisson":
         mu = np.maximum(y_pred, _BOUND_EPS)
         g = np.where(y_pred > _BOUND_EPS, 2.0 * (1.0 - y_true / mu), 0.0)
+    elif name == "negbinom":
+        alpha = loss_key[3]
+        mu = np.maximum(y_pred, _BOUND_EPS)
+        g = np.where(y_pred > _BOUND_EPS, 2.0 * (mu - y_true) / (mu * (1.0 + alpha * mu)), 0.0)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
     w = _full_weight(y_pred.shape, mask, weight)
