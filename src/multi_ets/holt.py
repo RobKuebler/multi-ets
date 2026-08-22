@@ -40,6 +40,24 @@ def _loss_key(loss: str | Callable[..., Any], delta: float, tau: float) -> Any:
 _LOSS_ID = {"mse": 0, "mae": 1, "huber": 2, "pinball": 3}
 
 
+def _resolve_sample_weight(sample_weight: Any, y: np.ndarray, custom: bool) -> np.ndarray | None:
+    """Validate fit()'s sample_weight (#25) against y; None if not given."""
+    if sample_weight is None:
+        return None
+    if custom:
+        raise ValueError("sample_weight is not supported with a custom callable loss")
+    weight = np.asarray(sample_weight, dtype=float)
+    if weight.shape != y.shape:
+        raise ValueError(
+            f"sample_weight must have the same length as y ({len(y)}), got {len(weight)}"
+        )
+    if np.any(weight < 0):
+        raise ValueError("sample_weight must be non-negative")
+    if weight.sum() <= 0:
+        raise ValueError("sample_weight must contain at least one positive weight")
+    return weight
+
+
 def _UNPACK_UNDAMPED(p: Any) -> tuple[Any, ...]:
     return (p[0], p[1], 1.0, p[2], p[3])
 
@@ -130,12 +148,46 @@ def _start_grid(n_starts: int, n_dims: int = 2) -> list[tuple[float, ...]]:
 # reuses them unchanged for its own d(loss)/d(forecast) step.
 
 
-def _masked_mean_np(x: np.ndarray, mask: np.ndarray | None) -> float:
-    """Mirrors _masked_mean, but plain NumPy."""
-    if mask is None:
+def _weight_matrix_np(sample_weight: np.ndarray, n_origins: int, h: int) -> np.ndarray:
+    """(n_origins, h) weight per (origin, horizon-step) cell: weight[t, k] = sample_weight[t + k].
+
+    Mirrors actuals's construction (np.stack([y[t : t + h] ...])) so that the
+    weight on a forecast-vs-actual term always matches the weight on the
+    observation y[t + k] it actually scores (#25) -- a given observation gets
+    the same weight in every origin window it appears in, not just the one
+    where it's the origin.
+    """
+    return np.stack([sample_weight[t : t + h] for t in range(n_origins)])
+
+
+def _full_weight(
+    shape: tuple[int, int], mask: np.ndarray | None, weight: np.ndarray | None
+) -> np.ndarray | None:
+    """Combine the origin mask and sample_weight (#25) into one (n_origins, h) weight array."""
+    if mask is None and weight is None:
+        return None
+    w = np.ones(shape)
+    if mask is not None:
+        w = w * mask[:, None]
+    if weight is not None:
+        w = w * weight
+    return w
+
+
+def _weighted_zero_safe(x: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Elementwise x * w, but exactly 0 wherever w == 0 (0 * inf/nan would otherwise be nan)."""
+    with np.errstate(invalid="ignore"):
+        return np.where(w > 0, x * w, 0.0)
+
+
+def _masked_mean_np(
+    x: np.ndarray, mask: np.ndarray | None, weight: np.ndarray | None = None
+) -> float:
+    """Mirrors _masked_mean, but plain NumPy; weight reweights each observation's contribution."""
+    w = _full_weight(x.shape, mask, weight)
+    if w is None:
         return float(x.mean())
-    weighted = np.where(mask[:, None], x, 0.0)
-    return float(weighted.sum() / (mask.sum() * x.shape[-1]))
+    return float(_weighted_zero_safe(x, w).sum() / w.sum())
 
 
 def _loss_value_np(
@@ -143,22 +195,29 @@ def _loss_value_np(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     mask: np.ndarray | None = None,
+    weight: np.ndarray | None = None,
 ) -> float:
-    """loss(y_true, y_pred), for a resolved built-in loss_key (see _loss_key)."""
+    """loss(y_true, y_pred), for a resolved built-in loss_key (see _loss_key).
+
+    weight (#25), shaped like y_true/y_pred, reweights each observation's
+    contribution, e.g. for recency weighting; None means every term counts
+    equally. See _weight_matrix_np for how a per-y-element sample_weight
+    becomes this per-(origin, horizon-step) shape.
+    """
     name, delta, tau = loss_key
     if name == "mse":
-        return _masked_mean_np((y_pred - y_true) ** 2, mask)
+        return _masked_mean_np((y_pred - y_true) ** 2, mask, weight)
     if name == "mae":
-        return _masked_mean_np(np.abs(y_pred - y_true), mask)
+        return _masked_mean_np(np.abs(y_pred - y_true), mask, weight)
     if name == "huber":
         r = y_pred - y_true
         abs_r = np.abs(r)
         quadratic = np.minimum(abs_r, delta)
         linear = abs_r - quadratic
-        return _masked_mean_np(0.5 * quadratic**2 + delta * linear, mask)
+        return _masked_mean_np(0.5 * quadratic**2 + delta * linear, mask, weight)
     if name == "pinball":
         e = y_true - y_pred
-        return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask)
+        return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask, weight)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -167,15 +226,14 @@ def _loss_grad_np(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     mask: np.ndarray | None = None,
+    weight: np.ndarray | None = None,
 ) -> np.ndarray:
     """d(loss)/d(y_pred), same shape as y_pred, for a resolved built-in loss_key.
 
     The one piece that changes between loss types; shared by the non-seasonal
-    (here) and seasonal (#19) BPTT passes.
+    (here) and seasonal (#19) BPTT passes. weight: see _loss_value_np.
     """
     name, delta, tau = loss_key
-    n = (mask.sum() if mask is not None else y_pred.shape[0]) * y_pred.shape[-1]
-    scale = (mask[:, None] if mask is not None else 1.0) / n
     if name == "mse":
         g = 2.0 * (y_pred - y_true)
     elif name == "mae":
@@ -186,7 +244,10 @@ def _loss_grad_np(
         g = np.where(y_true >= y_pred, -tau, 1.0 - tau)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
-    return g * scale
+    w = _full_weight(y_pred.shape, mask, weight)
+    if w is None:
+        return g / (y_pred.shape[0] * y_pred.shape[-1])
+    return _weighted_zero_safe(g, w) / w.sum()
 
 
 def _origin_mask_np(n_origins: int, n_valid: int, h: int) -> np.ndarray:
@@ -310,21 +371,27 @@ def _holt_objective_and_grad(
     kind: str,
     loss_key: tuple[str, float, float],
     n_valid: int | None = None,
+    sample_weight: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """(loss, grad) for the plain (non-seasonal) Holt recursion, hand-derived (#18).
 
     grad has the same length/layout as params (per _UNPACK_BY_KIND[kind]).
     loss_key must be a resolved built-in key (see _loss_key) -- callers fall
     back to scipy's own finite-difference jac for custom callables, since
-    those aren't differentiated here.
+    those aren't differentiated here. sample_weight (#25), if given, is one
+    weight per element of y; each loss term is weighted by the sample_weight
+    of the specific y observation it scores (see _weight_matrix_np), so an
+    observation is weighted consistently across every origin window it falls
+    into, not just the one where it's the origin.
     """
     alpha, beta, phi, levels, trends, multiplier, forecasts, actuals = _holt_forward_np(
         params, y, h, kind
     )
     n_origins = forecasts.shape[0]
     mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
-    value = _loss_value_np(loss_key, actuals, forecasts, mask)
-    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask)
+    weight = _weight_matrix_np(sample_weight, n_origins, h) if sample_weight is not None else None
+    value = _loss_value_np(loss_key, actuals, forecasts, mask, weight)
+    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight)
     grad5 = _states_bptt_grad_np(alpha, beta, phi, levels, trends, y, d_forecast, multiplier, h)
     return value, _PACK_GRAD_BY_KIND[kind](grad5)
 
@@ -551,6 +618,7 @@ def _seasonal_objective_and_grad(
     m: int,
     loss_key: tuple[str, float, float],
     n_valid: int | None = None,
+    sample_weight: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """(loss, grad) for the seasonal Holt-Winters recursion, hand-derived (#19).
 
@@ -558,7 +626,7 @@ def _seasonal_objective_and_grad(
     Mirrors _holt_objective_and_grad's non-seasonal shape; loss_key must be a
     resolved built-in key (see _loss_key) -- callers fall back to scipy's own
     finite-difference jac for custom callables, since those aren't
-    differentiated here.
+    differentiated here. sample_weight: see _holt_objective_and_grad.
     """
     multiplicative = kind in _MULTIPLICATIVE_KINDS
     (
@@ -577,8 +645,9 @@ def _seasonal_objective_and_grad(
     ) = _seasonal_forward_np(params, y, h, kind, m)
     n_origins = forecasts.shape[0]
     mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
-    value = _loss_value_np(loss_key, actuals, forecasts, mask)
-    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask)
+    weight = _weight_matrix_np(sample_weight, n_origins, h) if sample_weight is not None else None
+    value = _loss_value_np(loss_key, actuals, forecasts, mask, weight)
+    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight)
     grad_tuple = _seasonal_states_bptt_grad_np(
         alpha,
         beta,
@@ -627,8 +696,14 @@ class Holt:
         self.tau = tau
         self.params_: np.ndarray | None = None
 
-    def fit(self, y: Any) -> Self:
-        """Fit alpha/beta/level0/trend0 by joint multi-start optimization; returns self."""
+    def fit(self, y: Any, sample_weight: Any | None = None) -> Self:
+        """Fit alpha/beta/level0/trend0 by joint multi-start optimization; returns self.
+
+        sample_weight (#25), if given, is an array the same length as y that
+        reweights each observation's contribution to the loss (e.g. for
+        recency weighting); omitting it (or passing all-ones) reproduces the
+        unweighted fit.
+        """
         y = np.asarray(y, dtype=float)
         if len(y) < self.h + 1:
             raise ValueError(
@@ -638,6 +713,7 @@ class Holt:
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         custom = callable(loss_key)
         n_valid = len(y)
+        weight = _resolve_sample_weight(sample_weight, y, custom)
 
         def objective(p: np.ndarray) -> Any:
             if custom:
@@ -646,14 +722,17 @@ class Holt:
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
                 return float(loss_key(actuals, forecasts))
-            if _holt_hot is not None:
+            if _holt_hot is not None and weight is None:
                 name, delta, tau = loss_key
                 full5 = np.asarray(_UNPACK_BY_KIND[self._kind](p), dtype=float)
                 value, grad5 = _holt_hot.objective_and_grad(
                     full5, y, self.h, _LOSS_ID[name], delta, tau
                 )
                 return value, _PACK_GRAD_BY_KIND[self._kind](grad5)
-            return _holt_objective_and_grad(p, y, self.h, self._kind, loss_key, n_valid)
+            # ponytail: the compiled _holt_hot core doesn't take sample_weight
+            # yet, so weighted fits always use the NumPy path; teach it to
+            # _holt_hot.objective_and_grad if weighted fits need the speedup.
+            return _holt_objective_and_grad(p, y, self.h, self._kind, loss_key, n_valid, weight)
 
         # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
         free_guess = _heuristic_init(y)[: self._n_free_params]
@@ -803,8 +882,11 @@ class HoltWinters(Holt):
         if seasonal_type == "multiplicative":
             self._kind = self._kind + "_mult"
 
-    def fit(self, y: Any) -> Self:
-        """Fit trend and seasonal params by joint multi-start optimization; returns self."""
+    def fit(self, y: Any, sample_weight: Any | None = None) -> Self:
+        """Fit trend and seasonal params by joint multi-start optimization; returns self.
+
+        sample_weight: see Holt.fit.
+        """
         y = np.asarray(y, dtype=float)
         m = self.seasonal_period
         multiplicative = self.seasonal_type == "multiplicative"
@@ -821,6 +903,7 @@ class HoltWinters(Holt):
         loss_key = _loss_key(self.loss, self.delta, self.tau)
         custom = callable(loss_key)
         n_valid = len(y)
+        weight = _resolve_sample_weight(sample_weight, y, custom)
 
         def objective(p: np.ndarray) -> Any:
             if custom:
@@ -829,7 +912,7 @@ class HoltWinters(Holt):
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 forecasts, actuals = _seasonal_forward_np(p, y, self.h, self._kind, m)[-2:]
                 return float(loss_key(actuals, forecasts))
-            if _holt_hot is not None:
+            if _holt_hot is not None and weight is None:
                 name, delta, tau = loss_key
                 alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
                     self._kind
@@ -848,7 +931,11 @@ class HoltWinters(Holt):
                     grad_full[6:],
                 )
                 return value, _PACK_GRAD_SEASONAL_BY_KIND[self._kind](grad_tuple)
-            return _seasonal_objective_and_grad(p, y, self.h, self._kind, m, loss_key, n_valid)
+            # ponytail: see the non-seasonal fit() -- weighted fits skip the
+            # compiled core and always use the NumPy path.
+            return _seasonal_objective_and_grad(
+                p, y, self.h, self._kind, m, loss_key, n_valid, weight
+            )
 
         if multiplicative:
             level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(

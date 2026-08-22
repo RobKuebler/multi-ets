@@ -135,6 +135,30 @@ def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, 
     np.testing.assert_allclose(grad, numeric_grad, atol=1e-4, rtol=1e-4)
 
 
+def test_hand_derived_grad_matches_finite_difference_with_sample_weight():
+    # #25: sample_weight feeds into the same hand-derived BPTT gradient, so it
+    # needs its own finite-difference cross-check, with non-uniform weights
+    # (all-ones would not exercise the weighting math at all).
+    rng = np.random.default_rng(4)
+    h, kind, n_params = 3, "undamped", 4
+    y = np.cumsum(rng.normal(0, 1, 20)) + 10
+    loss_key = ("mse", 1.0, 0.5)
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    p = rng.uniform(0.1, 0.9, n_params)
+
+    def value(params):
+        return holt_module._holt_objective_and_grad(
+            params, y, h, kind, loss_key, sample_weight=sample_weight
+        )[0]
+
+    _, grad = holt_module._holt_objective_and_grad(
+        p, y, h, kind, loss_key, sample_weight=sample_weight
+    )
+    numeric_grad = approx_fprime(p, value, 1e-6)
+
+    np.testing.assert_allclose(grad, numeric_grad, atol=1e-4, rtol=1e-4)
+
+
 def _rand_seasonal_params(rng, kind, m, multiplicative):
     season0 = rng.uniform(0.5, 1.5, m) if multiplicative else rng.uniform(-1.0, 1.0, m)
     level0, trend0 = rng.uniform(-1.0, 1.0, 2)
@@ -173,6 +197,28 @@ def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, d
         return holt_module._seasonal_objective_and_grad(params, y, h, kind, m, loss_key)[0]
 
     _, grad = holt_module._seasonal_objective_and_grad(p, y, h, kind, m, loss_key)
+    numeric_grad = approx_fprime(p, value, 1e-6)
+
+    np.testing.assert_allclose(grad, numeric_grad, atol=1e-4, rtol=1e-4)
+
+
+def test_seasonal_hand_derived_grad_matches_finite_difference_with_sample_weight():
+    # #25, seasonal counterpart of the non-seasonal weighted-gradient check above.
+    rng = np.random.default_rng(5)
+    h, m, kind = 3, 4, "seasonal"
+    y = np.cumsum(rng.normal(0, 1, 20)) + 10
+    loss_key = ("mse", 1.0, 0.5)
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    p = _rand_seasonal_params(rng, kind, m, multiplicative=False)
+
+    def value(params):
+        return holt_module._seasonal_objective_and_grad(
+            params, y, h, kind, m, loss_key, sample_weight=sample_weight
+        )[0]
+
+    _, grad = holt_module._seasonal_objective_and_grad(
+        p, y, h, kind, m, loss_key, sample_weight=sample_weight
+    )
     numeric_grad = approx_fprime(p, value, 1e-6)
 
     np.testing.assert_allclose(grad, numeric_grad, atol=1e-4, rtol=1e-4)
@@ -447,3 +493,120 @@ def test_attribute_set_after_construction_is_honored_at_fit():
 
     direct = Holt(h=5, loss="huber", delta=20.0).fit(y)
     np.testing.assert_allclose(model.params_, direct.params_)
+
+
+@pytest.mark.parametrize(
+    "loss,kwargs", [("mse", {}), ("mae", {}), ("huber", {"delta": 0.8}), ("pinball", {"tau": 0.4})]
+)
+def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):
+    rng = np.random.default_rng(6)
+    y = 5.0 + 1.2 * np.arange(25) + rng.normal(0, 0.5, 25)
+    unweighted = Holt(h=3, loss=loss, n_starts=3, **kwargs).fit(y)
+    weighted = Holt(h=3, loss=loss, n_starts=3, **kwargs).fit(y, sample_weight=np.ones(len(y)))
+    np.testing.assert_allclose(weighted.params_, unweighted.params_, atol=1e-4)
+
+
+def test_sample_weight_omitted_matches_unweighted_fit():
+    y = 5.0 + 1.2 * np.arange(25)
+    weighted = Holt(h=3, loss="mse", n_starts=3).fit(y, sample_weight=None)
+    unweighted = Holt(h=3, loss="mse", n_starts=3).fit(y)
+    np.testing.assert_allclose(weighted.params_, unweighted.params_)
+
+
+def test_holt_winters_sample_weight_all_ones_matches_unweighted_fit():
+    rng = np.random.default_rng(7)
+    m = 4
+    y = 20 + 0.5 * np.arange(40) + 5 * np.sin(2 * np.pi * np.arange(40) / m)
+    y += rng.normal(0, 0.2, 40)
+    unweighted = HoltWinters(h=3, seasonal_period=m, n_starts=3).fit(y)
+    weighted = HoltWinters(h=3, seasonal_period=m, n_starts=3).fit(y, sample_weight=np.ones(40))
+    np.testing.assert_allclose(weighted.params_, unweighted.params_, atol=1e-4)
+
+
+def test_sample_weight_wrong_length_raises():
+    y = np.arange(20, dtype=float)
+    with pytest.raises(ValueError, match="sample_weight"):
+        Holt(h=3, loss="mse").fit(y, sample_weight=np.ones(10))
+
+
+def test_sample_weight_with_custom_callable_loss_raises():
+    def mse(y_true, y_pred):
+        return np.mean((y_pred - y_true) ** 2)
+
+    y = np.arange(20, dtype=float)
+    with pytest.raises(ValueError, match="custom callable"):
+        Holt(h=3, loss=mse).fit(y, sample_weight=np.ones(20))
+
+
+def test_sample_weight_negative_raises():
+    y = np.arange(20, dtype=float)
+    weight = np.ones(20)
+    weight[5] = -1.0
+    with pytest.raises(ValueError, match="non-negative"):
+        Holt(h=3, loss="mse").fit(y, sample_weight=weight)
+
+
+def test_sample_weight_all_zero_raises():
+    y = np.arange(20, dtype=float)
+    with pytest.raises(ValueError, match="positive weight"):
+        Holt(h=3, loss="mse").fit(y, sample_weight=np.zeros(20))
+
+
+def test_weight_matrix_aligns_with_actuals_construction():
+    # weight[t, k] must line up with actuals's np.stack([y[t:t+h] ...]) layout,
+    # so an observation is weighted the same in every origin window it falls
+    # into, not just the one where it's the origin.
+    sample_weight = np.arange(10, dtype=float)
+    n_origins, h = 4, 3
+    w = holt_module._weight_matrix_np(sample_weight, n_origins, h)
+    for t in range(n_origins):
+        np.testing.assert_array_equal(w[t], sample_weight[t : t + h])
+
+
+def test_sample_weight_zero_excludes_observation_from_every_origin_window():
+    # Same observation appears at (t, k) whenever t + k == target_index;
+    # zeroing its weight must drop all of those cells, not just the one
+    # where it's the origin (t == target_index, k == 0).
+    n_origins, h, target_index = 4, 3, 2
+    actuals = np.arange(n_origins * h, dtype=float).reshape(n_origins, h)
+    forecasts = np.zeros_like(actuals)
+    sample_weight = np.ones(n_origins + h - 1)
+    sample_weight[target_index] = 0.0
+    weight = holt_module._weight_matrix_np(sample_weight, n_origins, h)
+
+    value = holt_module._loss_value_np(("mse", 1.0, 0.5), actuals, forecasts, weight=weight)
+
+    kept = actuals[weight > 0]
+    assert value == pytest.approx(float((kept**2).mean()))
+
+
+def test_masked_mean_zero_weight_ignores_inf_term():
+    # A zero-weighted term must not poison the mean even if its value is inf
+    # (0 * inf = nan under plain multiplication).
+    x = np.array([[1.0, 2.0], [np.inf, np.inf], [3.0, 4.0]])
+    weight = np.array([[1.0, 1.0], [0.0, 0.0], [1.0, 1.0]])
+    result = holt_module._masked_mean_np(x, mask=None, weight=weight)
+    assert result == pytest.approx((1 + 2 + 3 + 4) / 4)
+
+
+def test_sample_weight_downweighting_outlier_improves_fit():
+    # Same spike as test_mae_is_less_pulled_by_outlier_than_mse, but instead of
+    # switching loss, downweight the spiked observation directly: the weighted
+    # fit should recover the clean trend better than the unweighted fit that
+    # has to explain the spike too.
+    h = 3
+    y = 5.0 + 1.5 * np.arange(30)
+    y_outlier = y.copy()
+    y_outlier[20] += 50
+    clean_forecast = y[-1] + 1.5 * np.arange(1, h + 1)
+
+    weight = np.ones(30)
+    weight[20] = 0.01
+
+    unweighted = Holt(h=h, loss="mse", n_starts=5).fit(y_outlier)
+    weighted = Holt(h=h, loss="mse", n_starts=5).fit(y_outlier, sample_weight=weight)
+
+    assert not np.allclose(weighted.params_, unweighted.params_)
+    err_unweighted = np.abs(unweighted.predict() - clean_forecast).mean()
+    err_weighted = np.abs(weighted.predict() - clean_forecast).mean()
+    assert err_weighted < err_unweighted
