@@ -40,6 +40,11 @@ def backtest(
     for split in range(n_splits):
         cutoff = len(y) - (n_splits - split) * h
         train, test = y[:cutoff], y[cutoff : cutoff + h]
+        if split == 0:
+            # statsforecast is numba-jitted: an untimed call here absorbs its
+            # one-time compilation cost so fold_times reflects steady-state
+            # speed, not a first-call outlier.
+            fit_predict(train, h)
         t0 = time.perf_counter()
         pred = fit_predict(train, h)
         fold_times.append(time.perf_counter() - t0)
