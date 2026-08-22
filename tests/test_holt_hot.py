@@ -7,6 +7,7 @@ uv run python setup.py build_ext --inplace in src/multi_ets/, see setup.py).
 import numpy as np
 import pytest
 
+from multi_ets import SES, DampedHolt, Holt
 from multi_ets import holt as holt_module
 
 _holt_hot = pytest.importorskip("multi_ets._holt_hot")
@@ -49,3 +50,39 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
 
     assert value_c == pytest.approx(value_np, abs=1e-9)
     np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
+
+
+@pytest.mark.parametrize("model_cls", [Holt, SES, DampedHolt])
+def test_fit_dispatches_to_compiled_backend(
+    model_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fit() with a built-in loss must actually call the compiled objective_and_grad.
+
+    A numerics-only test wouldn't catch "the dispatch silently never
+    triggers" (fit() would still converge correctly via the NumPy path) --
+    this spies on the compiled entry point to prove it's reached.
+    """
+    rng = np.random.default_rng(0)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    calls = []
+    real = _holt_hot.objective_and_grad
+
+    def spy(*args: object, **kwargs: object) -> tuple[float, np.ndarray]:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_holt_hot, "objective_and_grad", spy)
+    model_cls(h=3, n_starts=2).fit(y)
+    assert calls, "fit() did not call the compiled backend"
+
+
+def test_fit_with_custom_loss_does_not_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A custom callable loss must stay on the NumPy path, never the compiled one."""
+    rng = np.random.default_rng(0)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    calls = []
+    monkeypatch.setattr(
+        _holt_hot, "objective_and_grad", lambda *a, **k: calls.append(1) or (0.0, np.zeros(5))
+    )
+    Holt(h=3, n_starts=2, loss=lambda yt, yp: ((yt - yp) ** 2).mean()).fit(y)
+    assert not calls, "custom loss must not reach the compiled backend"

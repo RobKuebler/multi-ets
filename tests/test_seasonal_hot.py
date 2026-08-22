@@ -7,6 +7,7 @@ uv run python setup.py build_ext --inplace in src/multi_ets/, see setup.py).
 import numpy as np
 import pytest
 
+from multi_ets import DampedHoltWinters, HoltWinters
 from multi_ets import holt as holt_module
 
 _holt_hot = pytest.importorskip("multi_ets._holt_hot")
@@ -69,3 +70,31 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
 
     assert value_c == pytest.approx(value_np, abs=1e-12)
     np.testing.assert_allclose(grad_c, grad_np, atol=1e-12)
+
+
+@pytest.mark.parametrize("model_cls", [HoltWinters, DampedHoltWinters])
+@pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
+def test_fit_dispatches_to_compiled_backend(
+    model_cls: type, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fit() with a built-in loss must actually call the compiled seasonal_objective_and_grad.
+
+    A numerics-only test wouldn't catch "the dispatch silently never
+    triggers" -- this spies on the compiled entry point to prove it's reached.
+    """
+    rng = np.random.default_rng(0)
+    y = (
+        rng.uniform(15, 25, 40)
+        if seasonal_type == "multiplicative"
+        else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    )
+    calls = []
+    real = _holt_hot.seasonal_objective_and_grad
+
+    def spy(*args: object, **kwargs: object) -> tuple[float, np.ndarray]:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
+    model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2).fit(y)
+    assert calls, "fit() did not call the compiled backend"

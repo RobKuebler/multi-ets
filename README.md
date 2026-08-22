@@ -80,6 +80,26 @@ Holt(h=5, loss=lambda yt, yp: (yt - yp).var()).fit(y).predict()
 
 Fitting is non-convex, so each model restarts from `n_starts` (default 10) points spread across the parameter box and keeps the best, via a plain Python loop over `scipy.optimize.minimize`.
 
+### Fast (optional compiled) backend
+
+`multi_ets` installs and runs correctly as a pure-Python wheel with zero C toolchain. A compiled
+Cython hot loop (the fit objective + hand-derived gradient) is available as an opt-in speedup for
+built-in losses (`mse`/`mae`/`huber`/`pinball`); a custom callable `loss` always uses the NumPy
+path. When the compiled extension isn't built, everything silently falls back to NumPy -- nothing
+breaks either way. See `docs/adr/0002-optional-compiled-extension.md` for the full decision.
+
+To build it:
+
+```bash
+uv sync --extra fast   # or: pip install -e ".[fast]" -- installs cython + setuptools
+cd src/multi_ets && uv run python setup.py build_ext --inplace
+```
+
+Note: `uv sync --extra fast` alone does **not** build the extension -- this project's build backend
+(`uv_build`) only supports pure-Python packages and has no hook for compiling `.pyx` files as part
+of install. The `build_ext --inplace` step above is a real, separate manual step, not optional
+boilerplate.
+
 ## Model overview
 
 | Class | Trend | Seasonality |

@@ -8,6 +8,12 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import norm
 
+try:
+    from multi_ets import _holt_hot  # ty: ignore[unresolved-import]
+except ImportError:  # extension not built -- optional `[fast]` extra, see docs/adr/0002
+    _holt_hot = None
+_HOLT_HOT_AVAILABLE = _holt_hot is not None
+
 _BOUND_EPS = 1e-4
 # Standard classical-exponential-smoothing damping-parameter range (Hyndman &
 # Athanasopoulos); phi
@@ -28,6 +34,10 @@ def _loss_key(loss: str | Callable[..., Any], delta: float, tau: float) -> Any:
     if loss == "pinball" and not 0 < tau < 1:
         raise ValueError(f"pinball tau must be in (0, 1), got {tau}")
     return (loss, delta, tau)
+
+
+# loss_id convention shared with _holt_hot.pyx (0=mse, 1=mae, 2=huber, 3=pinball).
+_LOSS_ID = {"mse": 0, "mae": 1, "huber": 2, "pinball": 3}
 
 
 def _UNPACK_UNDAMPED(p: Any) -> tuple[Any, ...]:
@@ -636,6 +646,13 @@ class Holt:
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
                 return float(loss_key(actuals, forecasts))
+            if _holt_hot is not None:
+                name, delta, tau = loss_key
+                full5 = np.asarray(_UNPACK_BY_KIND[self._kind](p), dtype=float)
+                value, grad5 = _holt_hot.objective_and_grad(
+                    full5, y, self.h, _LOSS_ID[name], delta, tau
+                )
+                return value, _PACK_GRAD_BY_KIND[self._kind](grad5)
             return _holt_objective_and_grad(p, y, self.h, self._kind, loss_key, n_valid)
 
         # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
@@ -812,6 +829,25 @@ class HoltWinters(Holt):
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 forecasts, actuals = _seasonal_forward_np(p, y, self.h, self._kind, m)[-2:]
                 return float(loss_key(actuals, forecasts))
+            if _holt_hot is not None:
+                name, delta, tau = loss_key
+                alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
+                    self._kind
+                ](p, m)
+                full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
+                value, grad_full = _holt_hot.seasonal_objective_and_grad(
+                    full, y, self.h, m, int(multiplicative), _LOSS_ID[name], delta, tau
+                )
+                grad_tuple = (
+                    grad_full[0],
+                    grad_full[1],
+                    grad_full[2],
+                    grad_full[3],
+                    grad_full[4],
+                    grad_full[5],
+                    grad_full[6:],
+                )
+                return value, _PACK_GRAD_SEASONAL_BY_KIND[self._kind](grad_tuple)
             return _seasonal_objective_and_grad(p, y, self.h, self._kind, m, loss_key, n_valid)
 
         if multiplicative:

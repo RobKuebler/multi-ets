@@ -12,6 +12,18 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+# Compiled Cython hot loop (docs/adr/0001-cython-vs-rust-for-fitting-hot-loop.md,
+# docs/adr/0002-optional-compiled-extension.md): pulls in the Cython build tool
+# only, NOT a prebuilt wheel -- uv_build cannot compile extension modules, so
+# this extra alone does not build `_holt_hot`. See README.md's "Fast (optional
+# compiled) backend" section for the manual `setup.py build_ext --inplace`
+# step still required after `uv sync --extra fast` / `pip install -e ".[fast]"`.
+fast = [
+    "cython>=3.0",
+    "setuptools>=70",  # needed by src/multi_ets/setup.py's manual `build_ext --inplace` step
+]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.2",

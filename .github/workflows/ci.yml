@@ -32,3 +32,19 @@ jobs:
           enable-cache: true
       - run: uv sync --group dev
       - run: uv run pytest tests/ -q
+
+  test-fast:
+    # Optional [fast] extra (compiled Cython hot loop, docs/adr/0002): builds
+    # the extension and re-runs the hot-loop tests against it, so the
+    # compiled path doesn't silently bit-rot. uv_build can't compile
+    # extensions on `uv sync` alone (see docs/adr/0002), hence the explicit
+    # build_ext step.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --group dev --extra fast
+      - run: cd src/multi_ets && uv run python setup.py build_ext --inplace
+      - run: uv run pytest tests/test_holt_hot.py tests/test_seasonal_hot.py -q
