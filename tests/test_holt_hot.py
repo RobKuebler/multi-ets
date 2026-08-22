@@ -12,7 +12,7 @@ from multi_ets import holt as holt_module
 
 _holt_hot = pytest.importorskip("multi_ets._holt_hot")
 
-_LOSS_ID = {"mse": 0, "mae": 1, "huber": 2, "pinball": 3}
+_LOSS_ID = holt_module._LOSS_ID
 _KINDS = ("undamped", "damped", "ses")
 _LOSSES = ("mse", "mae", "huber", "pinball")
 _SEED = {(loss, kind): i for i, (loss, kind) in enumerate((L, K) for L in _LOSSES for K in _KINDS)}

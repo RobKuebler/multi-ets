@@ -12,7 +12,7 @@ from multi_ets import holt as holt_module
 
 _holt_hot = pytest.importorskip("multi_ets._holt_hot")
 
-_LOSS_ID = {"mse": 0, "mae": 1, "huber": 2, "pinball": 3}
+_LOSS_ID = holt_module._LOSS_ID
 _KINDS = ("seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult")
 _LOSSES = ("mse", "mae", "huber", "pinball")
 _SEED = {(loss, kind): i for i, (loss, kind) in enumerate((L, K) for L in _LOSSES for K in _KINDS)}
@@ -98,3 +98,19 @@ def test_fit_dispatches_to_compiled_backend(
     monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
     model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2).fit(y)
     assert calls, "fit() did not call the compiled backend"
+
+
+def test_fit_with_custom_loss_does_not_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A custom callable loss must stay on the NumPy path, never the compiled one."""
+    rng = np.random.default_rng(0)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    calls = []
+    monkeypatch.setattr(
+        _holt_hot,
+        "seasonal_objective_and_grad",
+        lambda *a, **k: calls.append(1) or (0.0, np.zeros(5 + _M)),
+    )
+    HoltWinters(
+        h=3, seasonal_period=_M, n_starts=2, loss=lambda yt, yp: ((yt - yp) ** 2).mean()
+    ).fit(y)
+    assert not calls, "custom loss must not reach the compiled backend"

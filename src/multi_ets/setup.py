@@ -1,8 +1,11 @@
 """Build script for the _holt_hot Cython extension (issue #22).
 
-Not wired into the package's real build yet (that's issue #24's call on
-required-vs-optional-dependency + CI wheel building); mirrors the issue #21
-spike's setup.py. Run from this directory:
+Wired in as the `[fast]` optional extra (#24) -- but `uv_build` (this
+project's build backend) doesn't build Cython extensions as part of
+`pip install`/`uv sync --extra fast`, so this script still has to be run
+manually, same as issue #21's spike. See docs/adr/0002-optional-compiled-extension.md
+and the README's "Fast (optional compiled) backend" section. Run from this
+directory:
 
     uv pip install cython
     uv run python setup.py build_ext --inplace
