@@ -26,13 +26,15 @@ Shared conventions between the two cores:
   seasonal function.
 - The built-in loss is picked at runtime via loss_id, mirroring
   _loss_value_np/_loss_grad_np's per-name branches:
-      0 = mse, 1 = mae, 2 = huber, 3 = pinball
-  delta/tau are only read by huber/pinball respectively. Both cores dispatch
-  through the same _loss_and_grad helper below.
+      0 = mse, 1 = mae, 2 = huber, 3 = pinball,
+      4 = poisson, 5 = negbinom, 6 = tweedie, 7 = expectile, 8 = logcosh
+  delta/tau are only read by huber/pinball/expectile; nb_alpha/tw_p are only
+  read by negbinom/tweedie respectively (#32). Both cores dispatch through
+  the same _loss_and_grad helper below.
 
 Custom callable losses are out of scope here (they stay on the NumPy path,
 per #18's `custom` branch in Holt.fit()/HoltWinters.fit()); these cores only
-serve the 4 built-ins.
+serve the 9 built-ins.
 
 No padding mask (n_valid == len(y) always in the current codebase, so the
 mask is always all-True -- see the ADR from #21).
@@ -49,17 +51,29 @@ plain Python -- see tests/test_holt_hot.py and tests/test_seasonal_hot.py.
 """
 import numpy as np
 cimport numpy as np
-from libc.math cimport fabs, fmax, fmin
+from libc.math cimport exp, fabs, fmax, fmin, log, log1p, pow, tanh
+
+# Matches holt.py's _BOUND_EPS -- the floor forecasts are clamped to before
+# feeding a log/power (poisson/negbinom/tweedie deviances are undefined at
+# forecast <= 0).
+cdef double _BOUND_EPS = 1e-4
+
+
+cdef inline double _xlogy(double x, double y):
+    """x * log(y), but exactly 0 when x == 0 (mirrors scipy.special.xlogy)."""
+    return 0.0 if x == 0.0 else x * log(y)
+
 
 cdef inline double _loss_and_grad(
-    double forecast, double true, int loss_id, double delta, double tau, double *g
+    double forecast, double true, int loss_id, double delta, double tau,
+    double nb_alpha, double tw_p, double *g
 ):
     """loss(forecast, true) and d(loss)/d(forecast), for one (t, k) pair.
 
     Mirrors _loss_value_np/_loss_grad_np's per-name formulas; shared by both
     cores below so the loss dispatch is written exactly once.
     """
-    cdef double resid, abs_r, quad, lin, e, loss
+    cdef double resid, abs_r, quad, lin, e, loss, mu, w_asym, r
     resid = forecast - true
     if loss_id == 0:  # mse
         loss = resid * resid
@@ -73,10 +87,37 @@ cdef inline double _loss_and_grad(
         lin = abs_r - quad
         loss = 0.5 * quad * quad + delta * lin
         g[0] = fmin(fmax(resid, -delta), delta)
-    else:  # pinball
+    elif loss_id == 3:  # pinball
         e = true - forecast
         loss = fmax(tau * e, (tau - 1.0) * e)
         g[0] = -tau if true >= forecast else (1.0 - tau)
+    elif loss_id == 4:  # poisson deviance
+        mu = fmax(forecast, _BOUND_EPS)
+        loss = 2.0 * (_xlogy(true, true / mu) - (true - mu))
+        g[0] = 2.0 * (1.0 - true / mu) if forecast > _BOUND_EPS else 0.0
+    elif loss_id == 5:  # negbinom deviance
+        mu = fmax(forecast, _BOUND_EPS)
+        loss = 2.0 * (
+            _xlogy(true, true / mu)
+            - (true + 1.0 / nb_alpha) * log((1.0 + nb_alpha * true) / (1.0 + nb_alpha * mu))
+        )
+        g[0] = 2.0 * (mu - true) / (mu * (1.0 + nb_alpha * mu)) if forecast > _BOUND_EPS else 0.0
+    elif loss_id == 6:  # tweedie deviance
+        mu = fmax(forecast, _BOUND_EPS)
+        loss = 2.0 * (
+            pow(true, 2.0 - tw_p) / ((1.0 - tw_p) * (2.0 - tw_p))
+            - true * pow(mu, 1.0 - tw_p) / (1.0 - tw_p)
+            + pow(mu, 2.0 - tw_p) / (2.0 - tw_p)
+        )
+        g[0] = 2.0 * pow(mu, -tw_p) * (mu - true) if forecast > _BOUND_EPS else 0.0
+    elif loss_id == 7:  # expectile
+        w_asym = tau if true >= forecast else (1.0 - tau)
+        loss = w_asym * resid * resid
+        g[0] = 2.0 * w_asym * resid
+    else:  # 8 = logcosh
+        r = fabs(resid)
+        loss = r + log1p(exp(-2.0 * r)) - log(2.0)
+        g[0] = tanh(resid)
     return loss
 
 
@@ -108,6 +149,8 @@ def objective_and_grad(
     int loss_id,
     double delta,
     double tau,
+    double nb_alpha=1.0,
+    double tw_p=1.5,
 ):
     cdef double alpha = params[0]
     cdef double beta = params[1]
@@ -145,7 +188,7 @@ def objective_and_grad(
         for k in range(h):
             forecast = levels[t] + multiplier[k] * trends[t]
             true = y[t + k]
-            loss += _loss_and_grad(forecast, true, loss_id, delta, tau, &g)
+            loss += _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
             d_forecast[t, k] = g
     loss /= n
     for t in range(n_origins):
@@ -208,6 +251,8 @@ def seasonal_objective_and_grad(
     int loss_id,
     double delta,
     double tau,
+    double nb_alpha=1.0,
+    double tw_p=1.5,
 ):
     """Mirrors _seasonal_states_np + _seasonal_states_bptt_grad_np +
     _seasonal_objective_and_grad.
@@ -281,7 +326,7 @@ def seasonal_objective_and_grad(
             else:
                 forecast = trend_part_val + seasonal_part_val
             true = y[t + k]
-            loss += _loss_and_grad(forecast, true, loss_id, delta, tau, &g)
+            loss += _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
 
             if multiplicative:
                 gl_direct[t] += g * seasonal_part_val

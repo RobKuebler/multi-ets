@@ -14,10 +14,22 @@ _holt_hot = pytest.importorskip("multi_ets._holt_hot")
 
 _LOSS_ID = holt_module._LOSS_ID
 _KINDS = ("seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult")
-_LOSSES = ("mse", "mae", "huber", "pinball")
+_LOSSES = (
+    "mse",
+    "mae",
+    "huber",
+    "pinball",
+    "poisson",
+    "negbinom",
+    "tweedie",
+    "expectile",
+    "logcosh",
+)
 _SEED = {(loss, kind): i for i, (loss, kind) in enumerate((L, K) for L in _LOSSES for K in _KINDS)}
 _DELTA = 0.7  # deliberately not the default 1.0, to exercise huber's clip boundary
-_TAU = 0.3  # deliberately not the default 0.5, to exercise pinball's asymmetry
+_TAU = 0.3  # deliberately not the default 0.5, to exercise pinball's/expectile's asymmetry
+_NB_ALPHA = 0.8  # deliberately not the default 1.0, to exercise negbinom's dispersion term
+_TW_P = 1.3  # deliberately not the default 1.5, to exercise tweedie's power parameter
 _M = 4  # season length
 
 
@@ -45,7 +57,7 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
     y = rng.uniform(15, 25, 40) if multiplicative else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
     h = 5
     params = _random_params(kind, rng, multiplicative)
-    loss_key = holt_module._loss_key(loss, _DELTA, _TAU)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
 
     value_np, grad_np = holt_module._seasonal_objective_and_grad(params, y, h, kind, _M, loss_key)
 
@@ -54,7 +66,7 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
     )
     full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
     value_c, grad_c_full = _holt_hot.seasonal_objective_and_grad(
-        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU
+        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
     )
     grad_c = holt_module._PACK_GRAD_SEASONAL_BY_KIND[kind](
         (
@@ -72,15 +84,18 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
     np.testing.assert_allclose(grad_c, grad_np, atol=1e-12)
 
 
+@pytest.mark.parametrize("loss", _LOSSES)
 @pytest.mark.parametrize("model_cls", [HoltWinters, DampedHoltWinters])
 @pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
 def test_fit_dispatches_to_compiled_backend(
-    model_cls: type, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
+    model_cls: type, seasonal_type: str, loss: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """fit() with a built-in loss must actually call the compiled seasonal_objective_and_grad.
 
     A numerics-only test wouldn't catch "the dispatch silently never
     triggers" -- this spies on the compiled entry point to prove it's reached.
+    Parametrized over every built-in loss (#32): the #26-30 losses need this
+    exercised end-to-end too, not just their objective_and_grad numerics above.
     """
     rng = np.random.default_rng(0)
     y = (
@@ -96,7 +111,7 @@ def test_fit_dispatches_to_compiled_backend(
         return real(*args, **kwargs)
 
     monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
-    model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2).fit(y)
+    model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss=loss).fit(y)
     assert calls, "fit() did not call the compiled backend"
 
 

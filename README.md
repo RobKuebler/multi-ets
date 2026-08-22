@@ -88,9 +88,10 @@ Fitting is non-convex, so each model restarts from `n_starts` (default 10) point
 
 `multi_ets` installs and runs correctly as a pure-Python wheel with zero C toolchain. A compiled
 Cython hot loop (the fit objective + hand-derived gradient) is available as an opt-in speedup for
-built-in losses (`mse`/`mae`/`huber`/`pinball`); a custom callable `loss` always uses the NumPy
-path. When the compiled extension isn't built, everything silently falls back to NumPy -- nothing
-breaks either way. See `docs/adr/0002-optional-compiled-extension.md` for the full decision.
+every built-in loss (`mse`/`mae`/`huber`/`pinball`/`poisson`/`negbinom`/`tweedie`/`expectile`/
+`logcosh`); a custom callable `loss` always uses the NumPy path. When the compiled extension isn't
+built, everything silently falls back to NumPy -- nothing breaks either way. See
+`docs/adr/0002-optional-compiled-extension.md` for the full decision.
 
 To build it:
 
