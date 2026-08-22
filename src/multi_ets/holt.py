@@ -262,6 +262,15 @@ def _loss_value_np(
             - (y_true + 1.0 / alpha) * np.log((1.0 + alpha * y_true) / (1.0 + alpha * mu))
         )
         return _masked_mean_np(dev, mask, weight)
+    if name == "tweedie":
+        p = loss_key[4]
+        mu = np.maximum(y_pred, _BOUND_EPS)
+        dev = 2.0 * (
+            y_true ** (2 - p) / ((1 - p) * (2 - p))
+            - y_true * mu ** (1 - p) / (1 - p)
+            + mu ** (2 - p) / (2 - p)
+        )
+        return _masked_mean_np(dev, mask, weight)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -293,6 +302,10 @@ def _loss_grad_np(
         alpha = loss_key[3]
         mu = np.maximum(y_pred, _BOUND_EPS)
         g = np.where(y_pred > _BOUND_EPS, 2.0 * (mu - y_true) / (mu * (1.0 + alpha * mu)), 0.0)
+    elif name == "tweedie":
+        p = loss_key[4]
+        mu = np.maximum(y_pred, _BOUND_EPS)
+        g = np.where(y_pred > _BOUND_EPS, 2.0 * mu ** (-p) * (mu - y_true), 0.0)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
     w = _full_weight(y_pred.shape, mask, weight)

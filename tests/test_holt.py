@@ -115,6 +115,7 @@ def test_custom_callable_loss_is_used_to_fit():
         ("pinball", 1.0, 0.3),
         ("poisson", 1.0, 0.5),
         ("negbinom", 1.0, 0.5),
+        ("tweedie", 1.0, 0.5),
     ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
@@ -186,6 +187,7 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
         ("pinball", 1.0, 0.3),
         ("poisson", 1.0, 0.5),
         ("negbinom", 1.0, 0.5),
+        ("tweedie", 1.0, 0.5),
     ],
 )
 @pytest.mark.parametrize(
@@ -558,6 +560,7 @@ def test_attribute_set_after_construction_is_honored_at_fit():
         ("pinball", {"tau": 0.4}),
         ("poisson", {}),
         ("negbinom", {"alpha": 2.0}),
+        ("tweedie", {"p": 1.3}),
     ],
 )
 def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):
@@ -744,3 +747,55 @@ def test_negbinom_achieves_lower_negbinom_deviance_than_poisson_on_overdispersed
     dev_pois = holt_module._loss_value_np(loss_key, actuals_pois, forecasts_pois)
 
     assert dev_nb < dev_pois
+
+
+def test_tweedie_smoke_fits_all_kinds():
+    # #28: loss="tweedie" must fit successfully (finite params/predictions) on
+    # a non-negative series, for every model class.
+    y = 5.0 + 1.2 * np.arange(25)
+    assert np.all(np.isfinite(Holt(h=3, loss="tweedie").fit(y).predict()))
+    assert np.all(np.isfinite(SES(h=3, loss="tweedie").fit(y).predict()))
+    assert np.all(np.isfinite(DampedHolt(h=3, loss="tweedie").fit(y).predict()))
+    y_seasonal = 20 + 0.5 * np.arange(40) + 5 * np.sin(2 * np.pi * np.arange(40) / 4)
+    hw = HoltWinters(h=3, seasonal_period=4, loss="tweedie").fit(y_seasonal)
+    assert np.all(np.isfinite(hw.predict()))
+
+
+def test_out_of_range_tweedie_p_raises():
+    with pytest.raises(ValueError, match="p must be"):
+        Holt(h=3, loss="tweedie", p=2.5)
+
+
+def test_tweedie_negative_y_raises():
+    y = np.array([1.0, 2.0, -1.0, 3.0, 4.0, 5.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="non-negative"):
+        Holt(h=3, loss="tweedie").fit(y)
+
+
+def test_tweedie_handles_zero_inflated_series_better_than_mse():
+    # Intermittent-demand series: mostly zero, with small sporadic demand and
+    # one huge one-off spike right before the forecast origin. MSE chases the
+    # spike's squared error and extrapolates a large trend into the forecast;
+    # tweedie's variance-scales-with-mean deviance is far less swayed by it.
+    # Both fits must stay finite/reasonably scaled, but tweedie's forecast
+    # error against a held-out, in-distribution (no repeat spike) future must
+    # be measurably smaller than mse's.
+    rng = np.random.default_rng(11)
+    n, h = 30, 3
+    y_fit = rng.gamma(2, 1, n) * rng.binomial(1, 0.3, n)
+    y_fit[-1] = 500.0  # one huge, one-off demand spike right before the origin
+    y_future = np.array([0.0, 3.0, 0.0])  # typical, in-distribution continuation
+
+    mse_fit = Holt(h=h, loss="mse", n_starts=8).fit(y_fit)
+    tweedie_fit = Holt(h=h, loss="tweedie", n_starts=8).fit(y_fit)
+
+    mse_pred = mse_fit.predict()
+    tweedie_pred = tweedie_fit.predict()
+    assert np.all(np.isfinite(mse_pred))
+    assert np.all(np.isfinite(tweedie_pred))
+    # reasonably scaled: not orders of magnitude beyond the data's own range
+    assert np.all(tweedie_pred < 10 * y_fit.max())
+
+    err_mse = np.abs(mse_pred - y_future).mean()
+    err_tweedie = np.abs(tweedie_pred - y_future).mean()
+    assert err_tweedie < err_mse
