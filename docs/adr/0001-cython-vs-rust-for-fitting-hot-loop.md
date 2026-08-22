@@ -192,6 +192,28 @@ multi_ets uses it at all), not something a compiled hot loop removes for
 free — a compiled hot loop makes each of those N restarts cheap, but N
 restarts of a compiled function is still N restarts.
 
+### Why cython and rust converge on many-tiny, and why neither beats statsforecast there
+
+Traced rather than assumed: `statsforecast`'s `Holt` doesn't call
+`scipy.optimize.minimize` at all — its whole fit, including its own
+optimizer loop (Nelder-Mead, not L-BFGS-B), runs inside one compiled
+extension call with no per-iteration Python↔native round-trip. Both
+multi_ets prototypes still drive the fit through Python's
+`scipy.optimize.minimize(method="L-BFGS-B")`, which costs ~0.06 ms/call in
+scipy's own dispatch overhead alone (bounds validation, Fortran workspace
+setup) — measured directly with a near-zero-compute objective through the
+same path. At the ~32 evaluations this fit takes to converge, that's ~2 ms
+of fixed overhead, matching the observed 2.5-2.7 ms cython/rust numbers
+above almost exactly: once the objective itself is sub-microsecond, cython
+and rust stop being bottlenecked on their own code and start being
+bottlenecked on scipy's per-iteration driver, which is identical for both.
+On one-long this fixed tax is swamped by real compute (n=700, h=45), so it
+doesn't show up there. Beating statsforecast on tiny series would mean
+compiling the optimizer loop itself, not just the objective+gradient — a
+bigger lift than this spike's scope (the ticket's own "maybe port the outer
+loop too" stretch option) and a candidate for its own follow-on ticket
+rather than more work in this spike.
+
 ## Decision
 
 **A compiled hot loop is clearly worth it if this is ever shipped — and,
