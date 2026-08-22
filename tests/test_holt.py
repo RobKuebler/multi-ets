@@ -108,7 +108,13 @@ def test_custom_callable_loss_is_used_to_fit():
 
 @pytest.mark.parametrize(
     "loss_name,delta,tau",
-    [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
+    [
+        ("mse", 1.0, 0.5),
+        ("mae", 1.0, 0.5),
+        ("huber", 0.7, 0.5),
+        ("pinball", 1.0, 0.3),
+        ("poisson", 1.0, 0.5),
+    ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
 def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, delta, tau):
@@ -172,7 +178,13 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
 
 @pytest.mark.parametrize(
     "loss_name,delta,tau",
-    [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
+    [
+        ("mse", 1.0, 0.5),
+        ("mae", 1.0, 0.5),
+        ("huber", 0.7, 0.5),
+        ("pinball", 1.0, 0.3),
+        ("poisson", 1.0, 0.5),
+    ],
 )
 @pytest.mark.parametrize(
     "kind", ["seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult"]
@@ -237,6 +249,46 @@ def test_non_positive_huber_delta_raises():
 def test_out_of_range_pinball_tau_raises():
     with pytest.raises(ValueError, match="tau must be in"):
         Holt(h=3, loss="pinball", tau=1.5)
+
+
+def test_poisson_loss_fits_on_count_like_series():
+    # Smoke test: every non-seasonal/seasonal kind fits successfully with
+    # loss="poisson" on a non-negative, count-like series (#26).
+    rng = np.random.default_rng(8)
+    y = rng.poisson(lam=20.0, size=30).astype(float)
+    m, h = 4, 3
+
+    Holt(h=h, loss="poisson", n_starts=3).fit(y)
+    SES(h=h, loss="poisson", n_starts=3).fit(y)
+    DampedHolt(h=h, loss="poisson", n_starts=3).fit(y)
+    HoltWinters(h=h, seasonal_period=m, loss="poisson", n_starts=3).fit(y)
+
+
+def test_poisson_loss_rejects_negative_y():
+    y = np.array([1.0, 2.0, -1.0, 3.0, 4.0, 5.0, 6.0])
+    with pytest.raises(ValueError, match="non-negative"):
+        Holt(h=3, loss="poisson").fit(y)
+
+
+def test_poisson_loss_gives_lower_poisson_deviance_than_mse():
+    # Core acceptance check (#26): fitting with the matching loss should beat
+    # fitting with a mismatched one, evaluated on that loss's own scale.
+    rng = np.random.default_rng(9)
+    h = 3
+    t = np.arange(40)
+    lam = 5.0 + 0.5 * t
+    y = rng.poisson(lam=lam).astype(float)
+
+    poisson_fit = Holt(h=h, loss="poisson", n_starts=5).fit(y)
+    mse_fit = Holt(h=h, loss="mse", n_starts=5).fit(y)
+
+    poisson_loss_key = ("poisson", 1.0, 0.5, 1.0, 1.5)
+
+    def poisson_deviance(model):
+        *_, forecasts, actuals = holt_module._holt_forward_np(model.params_, y, h, model._kind)
+        return holt_module._loss_value_np(poisson_loss_key, actuals, forecasts)
+
+    assert poisson_deviance(poisson_fit) < poisson_deviance(mse_fit)
 
 
 def test_damped_predict_returns_h_forecasts():
@@ -496,7 +548,14 @@ def test_attribute_set_after_construction_is_honored_at_fit():
 
 
 @pytest.mark.parametrize(
-    "loss,kwargs", [("mse", {}), ("mae", {}), ("huber", {"delta": 0.8}), ("pinball", {"tau": 0.4})]
+    "loss,kwargs",
+    [
+        ("mse", {}),
+        ("mae", {}),
+        ("huber", {"delta": 0.8}),
+        ("pinball", {"tau": 0.4}),
+        ("poisson", {}),
+    ],
 )
 def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):
     rng = np.random.default_rng(6)
