@@ -1,0 +1,5 @@
+# Regenerable build artifacts -- see README.md to rebuild.
+cython_proto/build/
+cython_proto/*.c
+cython_proto/*.so
+rust_proto/target/
