@@ -86,6 +86,36 @@ def test_huber_delta_measurably_affects_fit():
     assert not np.allclose(small_delta.params_, large_delta.params_)
 
 
+def test_logcosh_is_less_pulled_by_outlier_than_mse():
+    # log-cosh is a smooth Huber-like alternative (#30): it should be
+    # measurably more robust to an outlier than mse, comparable to huber/mae
+    # on the same contaminated series (mirrors test_mae_is_less_pulled_by_
+    # outlier_than_mse and test_huber_delta_measurably_affects_fit above).
+    h = 3
+    y = 5.0 + 1.5 * np.arange(30)
+    y_outlier = y.copy()
+    y_outlier[20] += 50  # spike well before the forecast origin
+
+    clean_forecast = y[-1] + 1.5 * np.arange(1, h + 1)
+    mse_fit = Holt(h=h, loss="mse", n_starts=5).fit(y_outlier)
+    huber_fit = Holt(h=h, loss="huber", n_starts=5).fit(y_outlier)
+    logcosh_fit = Holt(h=h, loss="logcosh", n_starts=5).fit(y_outlier)
+
+    mse_err = np.abs(mse_fit.predict() - clean_forecast).mean()
+    huber_err = np.abs(huber_fit.predict() - clean_forecast).mean()
+    logcosh_err = np.abs(logcosh_fit.predict() - clean_forecast).mean()
+
+    assert logcosh_err < 0.5 * mse_err  # meaningfully more robust than mse
+    assert logcosh_err < 2 * huber_err  # comparable in magnitude to huber's robustness
+
+
+def test_logcosh_fits_and_predicts_with_no_extra_params():
+    # Acceptance criterion (#30): loss="logcosh" alone is enough, no delta/tau/etc.
+    y = 3.0 + 2.0 * np.arange(30)
+    forecasts = Holt(h=5, loss="logcosh").fit(y).predict()
+    assert np.shape(forecasts) == (5,)
+
+
 def test_pinball_tau_orders_forecasts():
     h = 3
     rng = np.random.default_rng(3)
@@ -129,6 +159,7 @@ def test_custom_callable_loss_is_used_to_fit():
         ("negbinom", 1.0, 0.5),
         ("tweedie", 1.0, 0.5),
         ("expectile", 1.0, 0.3),
+        ("logcosh", 1.0, 0.5),
     ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
@@ -202,6 +233,7 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
         ("negbinom", 1.0, 0.5),
         ("tweedie", 1.0, 0.5),
         ("expectile", 1.0, 0.3),
+        ("logcosh", 1.0, 0.5),
     ],
 )
 @pytest.mark.parametrize(
@@ -581,6 +613,7 @@ def test_attribute_set_after_construction_is_honored_at_fit():
         ("negbinom", {"alpha": 2.0}),
         ("tweedie", {"p": 1.3}),
         ("expectile", {"tau": 0.3}),
+        ("logcosh", {}),
     ],
 )
 def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):

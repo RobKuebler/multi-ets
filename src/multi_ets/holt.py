@@ -274,6 +274,10 @@ def _loss_value_np(
     if name == "expectile":
         w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
         return _masked_mean_np(w_asym * (y_true - y_pred) ** 2, mask, weight)
+    if name == "logcosh":
+        r = y_pred - y_true
+        logcosh = np.abs(r) + np.log1p(np.exp(-2.0 * np.abs(r))) - np.log(2.0)
+        return _masked_mean_np(logcosh, mask, weight)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -312,6 +316,8 @@ def _loss_grad_np(
     elif name == "expectile":
         w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
         g = 2.0 * w_asym * (y_pred - y_true)
+    elif name == "logcosh":
+        g = np.tanh(y_pred - y_true)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
     w = _full_weight(y_pred.shape, mask, weight)
