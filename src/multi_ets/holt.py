@@ -74,7 +74,7 @@ _LOSS_ID = {
 }
 
 # Losses (#26-28) whose deviance is only defined for a non-negative y; checked once in
-# fit(), shared by Holt.fit and HoltWinters.fit.
+# ExponentialSmoothing.fit(), for both seasonal and non-seasonal kinds.
 _NONNEGATIVE_LOSSES = frozenset({"poisson", "negbinom", "tweedie"})
 
 
@@ -84,7 +84,7 @@ def _validate_nonnegative_y(loss_name: str, y: np.ndarray) -> None:
 
 
 def _warn_and_validate_nan(y: np.ndarray) -> None:
-    """Missing-value entry point shared by Holt.fit/HoltWinters.fit (#33/#34).
+    """Missing-value entry point shared by every fit() kind, seasonal and non-seasonal (#33/#34).
 
     An all-NaN y has nothing to fit -- hard error. A leading or trailing NaN
     run contributes nothing to the joint loss (nothing to skip-and-carry

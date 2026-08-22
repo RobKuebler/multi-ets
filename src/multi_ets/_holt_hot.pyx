@@ -33,7 +33,7 @@ Shared conventions between the two cores:
   the same _loss_and_grad helper below.
 
 Custom callable losses are out of scope here (they stay on the NumPy path,
-per #18's `custom` branch in Holt.fit()/HoltWinters.fit()); these cores only
+per #18's `custom` branch in ExponentialSmoothing.fit()); these cores only
 serve the 9 built-ins.
 
 Missing values (#35/#36): a NaN in y is skip-and-carry in the recursion
