@@ -69,10 +69,14 @@ forecasts = best.predict()
 
 ### Loss
 
-All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+ `tau`), or any callable `(y_true, y_pred) -> scalar` written in plain NumPy.
+All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+
+`tau`), `"expectile"` (+ `tau`), `"logcosh"`, `"poisson"`, `"negbinom"` (+ `alpha` dispersion), or
+`"tweedie"` (+ `p` power, `1 < p < 2`), or any callable `(y_true, y_pred) -> scalar` written in
+plain NumPy. `poisson`/`negbinom`/`tweedie` require a non-negative `y`.
 
 ```python
 Holt(h=5, loss="huber", delta=2.0).fit(y).predict()
+Holt(h=5, loss="tweedie", p=1.3).fit(y).predict()
 Holt(h=5, loss=lambda yt, yp: (yt - yp).var()).fit(y).predict()
 ```
 
