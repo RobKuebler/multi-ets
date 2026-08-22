@@ -2,9 +2,10 @@
 
 ## Status
 
-Proposed. This is a research spike (#31): the numbers below are a
-recommendation for the repo owner to review, not a decision already acted
-on.
+Accepted. Batch (joint multi-step) fitting stays the only fitting strategy
+`multi_ets` supports; the one-step-ahead adapter built for this spike is
+kept in `benchmarks/` as a reference baseline, not promoted into
+`src/multi_ets`.
 
 ## Context
 
@@ -106,4 +107,16 @@ production series behaves like it), the fallback isn't a new fitting mode:
 extended to CV-select fitting strategy too. That's a bigger change than
 this spike's scope and isn't proposed here.
 
-Left for the repo owner to weigh in on before this is acted on further.
+## Consequences
+
+- `multi_ets` continues to fit only via the joint multi-step loss; no
+  fitting-mode option is added to `Holt`/`HoltWinters`'s public API.
+- `benchmarks/adapters.py::one_step_ahead_adapter()` and
+  `benchmarks/run_model_comparison.py` stay in the benchmark suite as the
+  reference baseline this decision was made against, so a future series that
+  regresses under batch fitting can be checked against it without
+  re-deriving the adapter.
+- Revisit if a real-world series behaves like `real_gdp` (batch fit clearly
+  worse at longer horizons) -- the documented next step is extending
+  `select_model()` (#12) to CV-select fitting strategy, not reopening this
+  ADR's recommendation from scratch.
