@@ -21,23 +21,55 @@ _BOUND_EPS = 1e-4
 _PHI_UPPER = 0.98
 
 
-def _loss_key(loss: str | Callable[..., Any], delta: float, tau: float) -> Any:
-    """Hashable identity for a loss choice; a resolved built-in is (name, delta, tau)."""
+def _loss_key(
+    loss: str | Callable[..., Any],
+    delta: float,
+    tau: float,
+    alpha: float = 1.0,
+    p: float = 1.5,
+) -> Any:
+    """Hashable identity for a loss choice; a resolved built-in is (name, delta, tau, alpha, p)."""
     if callable(loss):
         return loss
-    if loss not in ("mse", "mae", "huber", "pinball"):
+    if loss not in (
+        "mse",
+        "mae",
+        "huber",
+        "pinball",
+        "poisson",
+        "negbinom",
+        "tweedie",
+        "expectile",
+        "logcosh",
+    ):
         raise ValueError(
-            f"Unknown loss {loss!r}; supported: mse, mae, huber, pinball, or a callable"
+            f"Unknown loss {loss!r}; supported: mse, mae, huber, pinball, poisson, negbinom, "
+            "tweedie, expectile, logcosh, or a callable"
         )
     if loss == "huber" and delta <= 0:
         raise ValueError(f"huber delta must be positive, got {delta}")
-    if loss == "pinball" and not 0 < tau < 1:
-        raise ValueError(f"pinball tau must be in (0, 1), got {tau}")
-    return (loss, delta, tau)
+    if loss in ("pinball", "expectile") and not 0 < tau < 1:
+        raise ValueError(f"{loss} tau must be in (0, 1), got {tau}")
+    if loss == "negbinom" and alpha <= 0:
+        raise ValueError(f"negbinom alpha (dispersion) must be positive, got {alpha}")
+    if loss == "tweedie" and not 1 < p < 2:
+        raise ValueError(f"tweedie p must be in (1, 2), got {p}")
+    return (loss, delta, tau, alpha, p)
 
 
-# loss_id convention shared with _holt_hot.pyx (0=mse, 1=mae, 2=huber, 3=pinball).
+# loss_id convention shared with _holt_hot.pyx (0=mse, 1=mae, 2=huber, 3=pinball). The
+# #26-30 losses aren't in this map -- the compiled core doesn't know them yet (#32) -- so
+# they always take the NumPy fit path (guarded by the `in _LOSS_ID` check in fit(), below).
 _LOSS_ID = {"mse": 0, "mae": 1, "huber": 2, "pinball": 3}
+
+# Losses (#26-28) whose deviance is only defined for a non-negative y; checked once in
+# fit(), shared by Holt.fit and HoltWinters.fit.
+_NONNEGATIVE_LOSSES = frozenset({"poisson", "negbinom", "tweedie"})
+
+
+def _validate_nonnegative_y(loss_name: str, y: np.ndarray) -> None:
+    if loss_name in _NONNEGATIVE_LOSSES and np.any(y < 0):
+        raise ValueError(f"loss={loss_name!r} requires a non-negative y, got a negative value")
 
 
 def _resolve_sample_weight(sample_weight: Any, y: np.ndarray, custom: bool) -> np.ndarray | None:
@@ -191,7 +223,7 @@ def _masked_mean_np(
 
 
 def _loss_value_np(
-    loss_key: tuple[str, float, float],
+    loss_key: tuple[str, float, float, float, float],
     y_true: np.ndarray,
     y_pred: np.ndarray,
     mask: np.ndarray | None = None,
@@ -204,7 +236,7 @@ def _loss_value_np(
     equally. See _weight_matrix_np for how a per-y-element sample_weight
     becomes this per-(origin, horizon-step) shape.
     """
-    name, delta, tau = loss_key
+    name, delta, tau = loss_key[:3]  # alpha/p: read by the one branch that needs them
     if name == "mse":
         return _masked_mean_np((y_pred - y_true) ** 2, mask, weight)
     if name == "mae":
@@ -222,7 +254,7 @@ def _loss_value_np(
 
 
 def _loss_grad_np(
-    loss_key: tuple[str, float, float],
+    loss_key: tuple[str, float, float, float, float],
     y_true: np.ndarray,
     y_pred: np.ndarray,
     mask: np.ndarray | None = None,
@@ -233,7 +265,7 @@ def _loss_grad_np(
     The one piece that changes between loss types; shared by the non-seasonal
     (here) and seasonal (#19) BPTT passes. weight: see _loss_value_np.
     """
-    name, delta, tau = loss_key
+    name, delta, tau = loss_key[:3]  # alpha/p: read by the one branch that needs them
     if name == "mse":
         g = 2.0 * (y_pred - y_true)
     elif name == "mae":
@@ -369,7 +401,7 @@ def _holt_objective_and_grad(
     y: np.ndarray,
     h: int,
     kind: str,
-    loss_key: tuple[str, float, float],
+    loss_key: tuple[str, float, float, float, float],
     n_valid: int | None = None,
     sample_weight: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
@@ -616,7 +648,7 @@ def _seasonal_objective_and_grad(
     h: int,
     kind: str,
     m: int,
-    loss_key: tuple[str, float, float],
+    loss_key: tuple[str, float, float, float, float],
     n_valid: int | None = None,
     sample_weight: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
@@ -687,13 +719,17 @@ class Holt:
         n_starts: int = 10,
         delta: float = 1.0,
         tau: float = 0.5,
+        alpha: float = 1.0,
+        p: float = 1.5,
     ) -> None:
-        _loss_key(loss, delta, tau)  # validate eagerly, re-resolved fresh in fit()
+        _loss_key(loss, delta, tau, alpha, p)  # validate eagerly, re-resolved fresh in fit()
         self.h = h
         self.loss = loss
         self.n_starts = n_starts
         self.delta = delta
         self.tau = tau
+        self.alpha = alpha
+        self.p = p
         self.params_: np.ndarray | None = None
 
     def fit(self, y: Any, sample_weight: Any | None = None) -> Self:
@@ -710,8 +746,10 @@ class Holt:
                 f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
             )
 
-        loss_key = _loss_key(self.loss, self.delta, self.tau)
+        loss_key = _loss_key(self.loss, self.delta, self.tau, self.alpha, self.p)
         custom = callable(loss_key)
+        if not custom:
+            _validate_nonnegative_y(loss_key[0], y)
         n_valid = len(y)
         weight = _resolve_sample_weight(sample_weight, y, custom)
 
@@ -722,8 +760,8 @@ class Holt:
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
                 return float(loss_key(actuals, forecasts))
-            if _holt_hot is not None and weight is None:
-                name, delta, tau = loss_key
+            if _holt_hot is not None and weight is None and loss_key[0] in _LOSS_ID:
+                name, delta, tau = loss_key[:3]
                 full5 = np.asarray(_UNPACK_BY_KIND[self._kind](p), dtype=float)
                 value, grad5 = _holt_hot.objective_and_grad(
                     full5, y, self.h, _LOSS_ID[name], delta, tau
@@ -871,8 +909,10 @@ class HoltWinters(Holt):
         n_starts: int = 10,
         delta: float = 1.0,
         tau: float = 0.5,
+        alpha: float = 1.0,
+        p: float = 1.5,
     ) -> None:
-        super().__init__(h, loss=loss, n_starts=n_starts, delta=delta, tau=tau)
+        super().__init__(h, loss=loss, n_starts=n_starts, delta=delta, tau=tau, alpha=alpha, p=p)
         if seasonal_type not in ("additive", "multiplicative"):
             raise ValueError(
                 f"Unknown seasonal_type {seasonal_type!r}; supported: 'additive', 'multiplicative'"
@@ -900,8 +940,10 @@ class HoltWinters(Holt):
                 f"{2 * m} points, got {len(y)}"
             )
 
-        loss_key = _loss_key(self.loss, self.delta, self.tau)
+        loss_key = _loss_key(self.loss, self.delta, self.tau, self.alpha, self.p)
         custom = callable(loss_key)
+        if not custom:
+            _validate_nonnegative_y(loss_key[0], y)
         n_valid = len(y)
         weight = _resolve_sample_weight(sample_weight, y, custom)
 
@@ -912,8 +954,8 @@ class HoltWinters(Holt):
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 forecasts, actuals = _seasonal_forward_np(p, y, self.h, self._kind, m)[-2:]
                 return float(loss_key(actuals, forecasts))
-            if _holt_hot is not None and weight is None:
-                name, delta, tau = loss_key
+            if _holt_hot is not None and weight is None and loss_key[0] in _LOSS_ID:
+                name, delta, tau = loss_key[:3]
                 alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
                     self._kind
                 ](p, m)

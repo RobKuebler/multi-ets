@@ -120,7 +120,7 @@ def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, 
     rng = np.random.default_rng(0)
     h = 3
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
-    loss_key = (loss_name, delta, tau)
+    loss_key = (loss_name, delta, tau, 1.0, 1.5)
 
     p = rng.uniform(0.1, 0.9, n_params)
     if kind == "damped":
@@ -142,7 +142,7 @@ def test_hand_derived_grad_matches_finite_difference_with_sample_weight():
     rng = np.random.default_rng(4)
     h, kind, n_params = 3, "undamped", 4
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
-    loss_key = ("mse", 1.0, 0.5)
+    loss_key = ("mse", 1.0, 0.5, 1.0, 1.5)
     sample_weight = rng.uniform(0.1, 2.0, len(y))
     p = rng.uniform(0.1, 0.9, n_params)
 
@@ -190,7 +190,7 @@ def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, d
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
     if multiplicative:
         y = y - y.min() + 5.0  # keep the series positive for y_t/level, y_t/s_old
-    loss_key = (loss_name, delta, tau)
+    loss_key = (loss_name, delta, tau, 1.0, 1.5)
     p = _rand_seasonal_params(rng, kind, m, multiplicative)
 
     def value(params):
@@ -207,7 +207,7 @@ def test_seasonal_hand_derived_grad_matches_finite_difference_with_sample_weight
     rng = np.random.default_rng(5)
     h, m, kind = 3, 4, "seasonal"
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
-    loss_key = ("mse", 1.0, 0.5)
+    loss_key = ("mse", 1.0, 0.5, 1.0, 1.5)
     sample_weight = rng.uniform(0.1, 2.0, len(y))
     p = _rand_seasonal_params(rng, kind, m, multiplicative=False)
 
@@ -574,7 +574,9 @@ def test_sample_weight_zero_excludes_observation_from_every_origin_window():
     sample_weight[target_index] = 0.0
     weight = holt_module._weight_matrix_np(sample_weight, n_origins, h)
 
-    value = holt_module._loss_value_np(("mse", 1.0, 0.5), actuals, forecasts, weight=weight)
+    value = holt_module._loss_value_np(
+        ("mse", 1.0, 0.5, 1.0, 1.5), actuals, forecasts, weight=weight
+    )
 
     kept = actuals[weight > 0]
     assert value == pytest.approx(float((kept**2).mean()))
