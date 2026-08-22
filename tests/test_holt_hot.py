@@ -103,3 +103,48 @@ def test_fit_with_custom_loss_does_not_dispatch(monkeypatch: pytest.MonkeyPatch)
     )
     Holt(h=3, n_starts=2, loss=lambda yt, yp: ((yt - yp) ** 2).mean()).fit(y)
     assert not calls, "custom loss must not reach the compiled backend"
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("loss", _LOSSES)
+def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
+    """#35: the compiled core's skip-and-carry + NaN-actual masking must match the NumPy path."""
+    rng = np.random.default_rng(_SEED[loss, kind] + 100)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[5] = np.nan
+    y[20] = np.nan
+    y[21] = np.nan
+    h = 5
+    params = _random_params(kind, rng)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
+
+    value_np, grad_np = holt_module._holt_objective_and_grad(params, y, h, kind, loss_key)
+
+    full5 = np.asarray(holt_module._UNPACK_BY_KIND[kind](params), dtype=float)
+    value_c, grad5_c = _holt_hot.objective_and_grad(
+        full5, y, h, _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
+    )
+    grad_c = holt_module._PACK_GRAD_BY_KIND[kind](grad5_c)
+
+    assert value_c == pytest.approx(value_np, abs=1e-9)
+    np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
+
+
+@pytest.mark.parametrize("model_cls", [Holt, SES, DampedHolt])
+def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
+    model_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#35: a NaN-containing y must still use the compiled backend, not fall back to NumPy."""
+    rng = np.random.default_rng(0)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[10] = np.nan
+    calls = []
+    real = _holt_hot.objective_and_grad
+
+    def spy(*args: object, **kwargs: object) -> tuple[float, np.ndarray]:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_holt_hot, "objective_and_grad", spy)
+    model_cls(h=3, n_starts=2, loss="mse").fit(y)
+    assert calls, "fit() did not call the compiled backend for a NaN-containing y"

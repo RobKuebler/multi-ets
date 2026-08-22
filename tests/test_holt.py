@@ -855,3 +855,227 @@ def test_tweedie_handles_zero_inflated_series_better_than_mse():
     err_mse = np.abs(mse_pred - y_future).mean()
     err_tweedie = np.abs(tweedie_pred - y_future).mean()
     assert err_tweedie < err_mse
+
+
+# --- Missing-value support (#33: non-seasonal, #34: seasonal) ---
+
+
+def test_states_np_skip_and_carry_matches_hand_computation():
+    y = np.array([1.0, 2.0, np.nan, 4.0, 5.0])
+    alpha, beta = 0.5, 0.5
+    levels, trends = holt_module._states_np(alpha, beta, 1.0, 0.0, 0.0, y)
+
+    level, trend = 0.0, 0.0
+    expected_levels, expected_trends = [level], [trend]
+    for yt in y:
+        if np.isnan(yt):
+            new_level, new_trend = level, trend
+        else:
+            new_level = alpha * yt + (1 - alpha) * (level + trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * trend
+        level, trend = new_level, new_trend
+        expected_levels.append(level)
+        expected_trends.append(trend)
+
+    np.testing.assert_allclose(levels, expected_levels)
+    np.testing.assert_allclose(trends, expected_trends)
+
+
+def test_holt_fits_and_predicts_with_interior_nan_gap():
+    y = 3.0 + 2.0 * np.arange(30)
+    y_gap = y.copy()
+    y_gap[10:12] = np.nan
+    forecasts = Holt(h=5, loss="mse").fit(y_gap).predict()
+    expected = y[-1] + 2.0 * np.arange(1, 6)
+    np.testing.assert_allclose(forecasts, expected, atol=0.5)
+
+
+def test_ses_fits_with_interior_nan_gap():
+    y = np.full(20, 7.0)
+    y[10] = np.nan
+    forecasts = SES(h=3, loss="mse").fit(y).predict()
+    np.testing.assert_allclose(forecasts, np.full(3, 7.0), atol=0.5)
+
+
+def test_damped_holt_fits_with_interior_nan_gap():
+    y = np.linspace(0, 10, 20)
+    y[10] = np.nan
+    forecasts = DampedHolt(h=4, loss="mse").fit(y).predict()
+    assert np.all(np.isfinite(forecasts))
+
+
+def test_leading_nan_run_warns_once():
+    y = 3.0 + 2.0 * np.arange(30)
+    y[:3] = np.nan
+    with pytest.warns(UserWarning, match="starts with a run of NaN") as record:
+        Holt(h=5, loss="mse").fit(y)
+    assert len(record) == 1
+
+
+def test_trailing_nan_run_warns_once():
+    y = 3.0 + 2.0 * np.arange(30)
+    y[-2:] = np.nan
+    with pytest.warns(UserWarning, match="ends with a run of NaN") as record:
+        Holt(h=5, loss="mse").fit(y)
+    assert len(record) == 1
+
+
+def test_leading_and_trailing_nan_runs_each_warn_once():
+    y = 3.0 + 2.0 * np.arange(30)
+    y[:2] = np.nan
+    y[-2:] = np.nan
+    with pytest.warns(UserWarning) as record:
+        Holt(h=5, loss="mse").fit(y)
+    assert len(record) == 2
+
+
+def test_all_nan_raises():
+    y = np.full(20, np.nan)
+    with pytest.raises(ValueError, match="all NaN"):
+        Holt(h=5, loss="mse").fit(y)
+
+
+def test_holt_winters_all_nan_raises():
+    y = np.full(20, np.nan)
+    with pytest.raises(ValueError, match="all NaN"):
+        HoltWinters(h=3, seasonal_period=4).fit(y)
+
+
+def test_predict_interval_correct_with_nan_in_fitted_series():
+    y = 3.0 + 2.0 * np.arange(30)
+    y[10] = np.nan
+    model = Holt(h=5, loss="mse").fit(y)
+    point = model.predict()
+    lower, upper = model.predict_interval(coverage=0.9)
+    assert np.all(np.isfinite(lower)) and np.all(np.isfinite(upper))
+    assert np.all(lower <= point) and np.all(point <= upper)
+
+
+def test_holt_objective_excludes_nan_actual_cells_from_every_origin_window():
+    # Mirrors test_sample_weight_zero_excludes_observation_from_every_origin_window
+    # (#25): a NaN actual must drop every (origin, k) cell it appears in, not
+    # just the one where it's the origin.
+    n_origins, h, target_index = 4, 3, 2
+    actuals = np.arange(n_origins * h, dtype=float).reshape(n_origins, h)
+    actuals_nan = actuals.copy()
+    for t in range(n_origins):
+        for k in range(h):
+            if t + k == target_index:
+                actuals_nan[t, k] = np.nan
+    forecasts = np.zeros_like(actuals)
+
+    actual_mask = holt_module._nan_actual_mask(actuals_nan)
+    value = holt_module._loss_value_np(
+        ("mse", 1.0, 0.5, 1.0, 1.5), actuals_nan, forecasts, actual_mask=actual_mask
+    )
+
+    kept = actuals[actual_mask]
+    assert value == pytest.approx(float((kept**2).mean()))
+
+
+def test_heuristic_init_skips_leading_nan():
+    y = np.concatenate([[np.nan, np.nan], 3.0 + 2.0 * np.arange(15)])
+    _level0, trend0 = holt_module._heuristic_init(y)
+    assert trend0 == pytest.approx(2.0, abs=0.3)
+
+
+def test_heuristic_init_degenerate_single_valid_point():
+    y = np.array([np.nan, np.nan, 5.0, np.nan])
+    level0, trend0 = holt_module._heuristic_init(y)
+    assert level0 == pytest.approx(5.0)
+    assert trend0 == pytest.approx(0.0)
+
+
+def test_holt_winters_additive_fits_with_interior_nan_gap():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y_full = 20.0 + 1.5 * t + seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+    y_gap = y_fit.copy()
+    y_gap[10] = np.nan
+
+    forecasts = HoltWinters(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y_gap).predict()
+    np.testing.assert_allclose(forecasts, y_future, atol=1.0)
+
+
+def test_holt_winters_multiplicative_fits_with_interior_nan_gap():
+    # Division-rule skip: the missing observation must be skipped entirely,
+    # never divided by (#34).
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y_full = (20.0 + 1.5 * t) * seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+    y_gap = y_fit.copy()
+    y_gap[10] = np.nan
+
+    forecasts = (
+        HoltWinters(h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse", n_starts=8)
+        .fit(y_gap)
+        .predict()
+    )
+    np.testing.assert_allclose(forecasts, y_future, atol=1.5)
+
+
+def test_damped_holt_winters_fits_with_interior_nan_gap():
+    m = 4
+    t = np.arange(48)
+    y = 100.0 + t.astype(float) + np.tile([5.0, -3.0, -4.0, 2.0], 12)
+    y[20] = np.nan
+    forecasts = DampedHoltWinters(h=4, seasonal_period=m, loss="mse", n_starts=5).fit(y).predict()
+    assert np.all(np.isfinite(forecasts))
+
+
+def test_holt_winters_leading_nan_run_warns_once():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y = 20.0 + 1.5 * t + seasonal_true[t % m]
+    y[:2] = np.nan
+    with pytest.warns(UserWarning, match="starts with a run of NaN") as record:
+        HoltWinters(h=h, seasonal_period=m, loss="mse").fit(y)
+    assert len(record) == 1
+
+
+def test_holt_winters_predict_interval_correct_with_nan_in_fitted_series():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y = 20.0 + 1.5 * t + seasonal_true[t % m]
+    y[10] = np.nan
+
+    model = HoltWinters(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y)
+    point = model.predict()
+    lower, upper = model.predict_interval(coverage=0.9)
+    assert np.all(np.isfinite(lower)) and np.all(np.isfinite(upper))
+    assert np.all(lower <= point) and np.all(point <= upper)
+
+
+def test_heuristic_seasonal_init_skips_interior_nan():
+    m = 4
+    t = np.arange(12)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y = 20.0 + 1.5 * t + seasonal_true[t % m]
+    y[2] = np.nan
+
+    level0, trend0, season0 = holt_module._heuristic_seasonal_init(y, m)
+    assert np.isfinite(level0)
+    assert np.isfinite(trend0)
+    assert np.all(np.isfinite(season0))
+
+
+def test_heuristic_seasonal_init_degenerate_single_valid_point():
+    y = np.array([np.nan, np.nan, 5.0, np.nan, np.nan, np.nan, np.nan, np.nan])
+    level0, trend0, season0 = holt_module._heuristic_seasonal_init(y, m=4)
+    assert level0 == pytest.approx(5.0)
+    assert trend0 == pytest.approx(0.0)
+    np.testing.assert_allclose(season0, np.zeros(4))
+
+
+def test_heuristic_seasonal_init_multiplicative_degenerate_single_valid_point():
+    y = np.array([np.nan, np.nan, 5.0, np.nan, np.nan, np.nan, np.nan, np.nan])
+    level0, trend0, season0 = holt_module._heuristic_seasonal_init_multiplicative(y, m=4)
+    assert level0 == pytest.approx(5.0)
+    assert trend0 == pytest.approx(0.0)
+    np.testing.assert_allclose(season0, np.ones(4))

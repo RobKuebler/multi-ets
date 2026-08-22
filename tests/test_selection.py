@@ -1,6 +1,6 @@
 import numpy as np
 
-from multi_ets import SES, HoltWinters, select_model
+from multi_ets import SES, Holt, HoltWinters, select_model
 
 
 def test_select_model_picks_seasonal_model_on_seasonal_data():
@@ -40,3 +40,16 @@ def test_select_model_scores_custom_callable_loss_candidate():
     best, scores = select_model(candidates, y, n_splits=2)
     assert isinstance(best, SES)
     assert scores[candidates[0]] >= 0.0
+
+
+def test_select_model_ignores_nan_actual_in_a_cv_test_fold():
+    # A NaN landing in a CV test fold must be zero-weighted in that fold's
+    # score (mirrors holt.py's own _nan_actual_mask), not poison the whole
+    # candidate's mean CV loss to NaN.
+    y = 3.0 + 2.0 * np.arange(30)
+    y_gap = y.copy()
+    y_gap[-1] = np.nan  # lands in the last split's test fold
+
+    candidates = [Holt(h=3, loss="mse")]
+    _, scores = select_model(candidates, y_gap, n_splits=2)
+    assert np.isfinite(scores[candidates[0]])

@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from multi_ets.holt import Holt, _loss_key, _loss_value_np
+from multi_ets.holt import Holt, _loss_key, _loss_value_np, _nan_actual_mask
 
 
 def select_model(
@@ -39,7 +39,9 @@ def select_model(
             candidate.fit(train)
             pred = candidate.predict()
             loss = (
-                loss_key(test, pred) if callable(loss_key) else _loss_value_np(loss_key, test, pred)
+                loss_key(test, pred)
+                if callable(loss_key)
+                else _loss_value_np(loss_key, test, pred, actual_mask=_nan_actual_mask(test))
             )
             losses.append(float(loss))
         scores[candidate] = float(np.mean(losses))

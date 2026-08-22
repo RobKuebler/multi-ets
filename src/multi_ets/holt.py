@@ -1,6 +1,7 @@
 """Holt's linear trend model, fit by minimizing a joint h-step-ahead loss."""
 
 import itertools
+import warnings
 from collections.abc import Callable
 from typing import Any, Self
 
@@ -82,6 +83,30 @@ def _validate_nonnegative_y(loss_name: str, y: np.ndarray) -> None:
         raise ValueError(f"loss={loss_name!r} requires a non-negative y, got a negative value")
 
 
+def _warn_and_validate_nan(y: np.ndarray) -> None:
+    """Missing-value entry point shared by Holt.fit/HoltWinters.fit (#33/#34).
+
+    An all-NaN y has nothing to fit -- hard error. A leading or trailing NaN
+    run contributes nothing to the joint loss (nothing to skip-and-carry
+    into), so each gets its own one-time warning; interior NaN gaps are
+    handled silently by the shared skip-and-carry recursion.
+    """
+    if np.all(np.isnan(y)):
+        raise ValueError("y is all NaN; nothing to fit")
+    if np.isnan(y[0]):
+        warnings.warn(
+            "y starts with a run of NaN values; they contribute nothing to the fit",
+            UserWarning,
+            stacklevel=3,
+        )
+    if np.isnan(y[-1]):
+        warnings.warn(
+            "y ends with a run of NaN values; they contribute nothing to the fit",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _resolve_sample_weight(sample_weight: Any, y: np.ndarray, custom: bool) -> np.ndarray | None:
     """Validate fit()'s sample_weight (#25) against y; None if not given."""
     if sample_weight is None:
@@ -139,9 +164,23 @@ _MULTIPLICATIVE_KINDS = frozenset({"seasonal_mult", "damped_seasonal_mult"})
 
 
 def _heuristic_init(y: Any) -> tuple[float, float]:
-    k = min(10, len(y))
-    trend0, level0 = np.polyfit(np.arange(k), np.asarray(y)[:k], 1)
+    y = np.asarray(y)
+    idx = np.flatnonzero(~np.isnan(y))[:10]  # first ~10 non-NaN points (#33), by real position
+    if len(idx) < 2:  # degenerate: fewer than 2 usable points to fit a line through
+        return float(y[idx[0]]) if len(idx) else 0.0, 0.0
+    trend0, level0 = np.polyfit(idx, y[idx], 1)
     return float(level0), float(trend0)
+
+
+def _seasonal_init_window(y: Any, m: int) -> np.ndarray:
+    """First ~2*m non-NaN positions of y (#34), by real position (not compacted index).
+
+    Shared by both heuristic seasonal inits below: real position matters
+    because season phase (idx % m) has to line up with actual elapsed time,
+    not with how many valid points happened to precede it.
+    """
+    y = np.asarray(y)
+    return np.flatnonzero(~np.isnan(y))[: 2 * m]
 
 
 def _heuristic_seasonal_init(y: Any, m: int) -> tuple[float, float, np.ndarray]:
@@ -149,12 +188,17 @@ def _heuristic_seasonal_init(y: Any, m: int) -> tuple[float, float, np.ndarray]:
 
     season0 is the per-season-of-cycle average deviation from that line.
     """
-    k = min(2 * m, len(y))
-    idx = np.arange(k)
-    y_k = np.asarray(y)[:k]
+    y = np.asarray(y)
+    idx = _seasonal_init_window(y, m)
+    if len(idx) < 2:  # degenerate: fewer than 2 usable points to fit a line through
+        return (float(y[idx[0]]) if len(idx) else 0.0), 0.0, np.zeros(m)
+    y_k = y[idx]
     trend0, level0 = np.polyfit(idx, y_k, 1)
     deviations = y_k - (level0 + trend0 * idx)
-    season0 = np.array([deviations[idx % m == s].mean() for s in range(m)])
+    phase = idx % m
+    season0 = np.array(
+        [deviations[phase == s].mean() if np.any(phase == s) else 0.0 for s in range(m)]
+    )
     return float(level0), float(trend0), season0
 
 
@@ -164,12 +208,15 @@ def _heuristic_seasonal_init_multiplicative(y: Any, m: int) -> tuple[float, floa
     season0 is the per-season-of-cycle average of y / trend-line instead of
     y - trend-line.
     """
-    k = min(2 * m, len(y))
-    idx = np.arange(k)
-    y_k = np.asarray(y)[:k]
+    y = np.asarray(y)
+    idx = _seasonal_init_window(y, m)
+    if len(idx) < 2:  # degenerate: fewer than 2 usable points to fit a line through
+        return (float(y[idx[0]]) if len(idx) else 0.0), 0.0, np.ones(m)
+    y_k = y[idx]
     trend0, level0 = np.polyfit(idx, y_k, 1)
     ratios = y_k / (level0 + trend0 * idx)
-    season0 = np.array([ratios[idx % m == s].mean() for s in range(m)])
+    phase = idx % m
+    season0 = np.array([ratios[phase == s].mean() if np.any(phase == s) else 1.0 for s in range(m)])
     return float(level0), float(trend0), np.maximum(season0, _BOUND_EPS)
 
 
@@ -203,16 +250,27 @@ def _weight_matrix_np(sample_weight: np.ndarray, n_origins: int, h: int) -> np.n
 
 
 def _full_weight(
-    shape: tuple[int, int], mask: np.ndarray | None, weight: np.ndarray | None
+    shape: tuple[int, int],
+    mask: np.ndarray | None,
+    weight: np.ndarray | None,
+    actual_mask: np.ndarray | None = None,
 ) -> np.ndarray | None:
-    """Combine the origin mask and sample_weight (#25) into one (n_origins, h) weight array."""
-    if mask is None and weight is None:
+    """Combine the origin mask, sample_weight (#25), and NaN-actual mask (#33) into one weight.
+
+    actual_mask, when given, is already (n_origins, h)-shaped (one bool per
+    joint-loss cell, unlike mask which is per-origin) -- see
+    _holt_objective_and_grad/_seasonal_objective_and_grad, which build it from
+    the actuals matrix and pass it through only when it contains a NaN.
+    """
+    if mask is None and weight is None and actual_mask is None:
         return None
     w = np.ones(shape)
     if mask is not None:
         w = w * mask[:, None]
     if weight is not None:
         w = w * weight
+    if actual_mask is not None:
+        w = w * actual_mask
     return w
 
 
@@ -222,11 +280,24 @@ def _weighted_zero_safe(x: np.ndarray, w: np.ndarray) -> np.ndarray:
         return np.where(w > 0, x * w, 0.0)
 
 
+def _nan_actual_mask(actuals: np.ndarray) -> np.ndarray | None:
+    """(n_origins, h) mask zeroing any cell whose actual is NaN (#33); None if none are.
+
+    None in the NaN-free case keeps _full_weight on its no-op fast path, so
+    existing NaN-free fits are bit-for-bit unaffected.
+    """
+    is_nan = np.isnan(actuals)
+    return ~is_nan if is_nan.any() else None
+
+
 def _masked_mean_np(
-    x: np.ndarray, mask: np.ndarray | None, weight: np.ndarray | None = None
+    x: np.ndarray,
+    mask: np.ndarray | None,
+    weight: np.ndarray | None = None,
+    actual_mask: np.ndarray | None = None,
 ) -> float:
     """Mirrors _masked_mean, but plain NumPy; weight reweights each observation's contribution."""
-    w = _full_weight(x.shape, mask, weight)
+    w = _full_weight(x.shape, mask, weight, actual_mask)
     if w is None:
         return float(x.mean())
     return float(_weighted_zero_safe(x, w).sum() / w.sum())
@@ -238,32 +309,34 @@ def _loss_value_np(
     y_pred: np.ndarray,
     mask: np.ndarray | None = None,
     weight: np.ndarray | None = None,
+    actual_mask: np.ndarray | None = None,
 ) -> float:
     """loss(y_true, y_pred), for a resolved built-in loss_key (see _loss_key).
 
     weight (#25), shaped like y_true/y_pred, reweights each observation's
     contribution, e.g. for recency weighting; None means every term counts
     equally. See _weight_matrix_np for how a per-y-element sample_weight
-    becomes this per-(origin, horizon-step) shape.
+    becomes this per-(origin, horizon-step) shape. actual_mask (#33): see
+    _full_weight.
     """
     name, delta, tau = loss_key[:3]  # alpha/p: read by the one branch that needs them
     if name == "mse":
-        return _masked_mean_np((y_pred - y_true) ** 2, mask, weight)
+        return _masked_mean_np((y_pred - y_true) ** 2, mask, weight, actual_mask)
     if name == "mae":
-        return _masked_mean_np(np.abs(y_pred - y_true), mask, weight)
+        return _masked_mean_np(np.abs(y_pred - y_true), mask, weight, actual_mask)
     if name == "huber":
         r = y_pred - y_true
         abs_r = np.abs(r)
         quadratic = np.minimum(abs_r, delta)
         linear = abs_r - quadratic
-        return _masked_mean_np(0.5 * quadratic**2 + delta * linear, mask, weight)
+        return _masked_mean_np(0.5 * quadratic**2 + delta * linear, mask, weight, actual_mask)
     if name == "pinball":
         e = y_true - y_pred
-        return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask, weight)
+        return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask, weight, actual_mask)
     if name == "poisson":
         mu = np.maximum(y_pred, _BOUND_EPS)
         dev = 2.0 * (xlogy(y_true, y_true / mu) - (y_true - mu))
-        return _masked_mean_np(dev, mask, weight)
+        return _masked_mean_np(dev, mask, weight, actual_mask)
     if name == "negbinom":
         alpha = loss_key[3]
         mu = np.maximum(y_pred, _BOUND_EPS)
@@ -271,7 +344,7 @@ def _loss_value_np(
             xlogy(y_true, y_true / mu)
             - (y_true + 1.0 / alpha) * np.log((1.0 + alpha * y_true) / (1.0 + alpha * mu))
         )
-        return _masked_mean_np(dev, mask, weight)
+        return _masked_mean_np(dev, mask, weight, actual_mask)
     if name == "tweedie":
         p = loss_key[4]
         mu = np.maximum(y_pred, _BOUND_EPS)
@@ -280,14 +353,14 @@ def _loss_value_np(
             - y_true * mu ** (1 - p) / (1 - p)
             + mu ** (2 - p) / (2 - p)
         )
-        return _masked_mean_np(dev, mask, weight)
+        return _masked_mean_np(dev, mask, weight, actual_mask)
     if name == "expectile":
         w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
-        return _masked_mean_np(w_asym * (y_true - y_pred) ** 2, mask, weight)
+        return _masked_mean_np(w_asym * (y_true - y_pred) ** 2, mask, weight, actual_mask)
     if name == "logcosh":
         r = y_pred - y_true
         logcosh = np.abs(r) + np.log1p(np.exp(-2.0 * np.abs(r))) - np.log(2.0)
-        return _masked_mean_np(logcosh, mask, weight)
+        return _masked_mean_np(logcosh, mask, weight, actual_mask)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -297,11 +370,12 @@ def _loss_grad_np(
     y_pred: np.ndarray,
     mask: np.ndarray | None = None,
     weight: np.ndarray | None = None,
+    actual_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """d(loss)/d(y_pred), same shape as y_pred, for a resolved built-in loss_key.
 
     The one piece that changes between loss types; shared by the non-seasonal
-    (here) and seasonal (#19) BPTT passes. weight: see _loss_value_np.
+    (here) and seasonal (#19) BPTT passes. weight/actual_mask: see _loss_value_np.
     """
     name, delta, tau = loss_key[:3]  # alpha/p: read by the one branch that needs them
     if name == "mse":
@@ -330,7 +404,7 @@ def _loss_grad_np(
         g = np.tanh(y_pred - y_true)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
-    w = _full_weight(y_pred.shape, mask, weight)
+    w = _full_weight(y_pred.shape, mask, weight, actual_mask)
     if w is None:
         return g / (y_pred.shape[0] * y_pred.shape[-1])
     return _weighted_zero_safe(g, w) / w.sum()
@@ -363,8 +437,11 @@ def _states_np(
     levels[0], trends[0] = level0, trend0
     for t in range(t_max):
         level, trend = levels[t], trends[t]
-        new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
-        new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+        if np.isnan(y[t]):  # missing observation (#33): skip the update, carry state forward
+            new_level, new_trend = level, trend
+        else:
+            new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
         levels[t + 1], trends[t + 1] = new_level, new_trend
     return levels, trends
 
@@ -413,6 +490,9 @@ def _states_bptt_grad_np(
     for t in range(n_origins - 1, 0, -1):
         gl_t = gl_direct[t] + gl_next
         gt_t = gt_direct[t] + gt_next
+        if np.isnan(y[t - 1]):  # skipped step (#33): identity backprop, no param gradient
+            gl_next, gt_next = gl_t, gt_t
+            continue
         level_prev, trend_prev = levels[t - 1], trends[t - 1]
         y_prev = y[t - 1]
         pre_activation = y_prev - level_prev - phi * trend_prev
@@ -476,8 +556,9 @@ def _holt_objective_and_grad(
     n_origins = forecasts.shape[0]
     mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
     weight = _weight_matrix_np(sample_weight, n_origins, h) if sample_weight is not None else None
-    value = _loss_value_np(loss_key, actuals, forecasts, mask, weight)
-    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight)
+    actual_mask = _nan_actual_mask(actuals)
+    value = _loss_value_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
+    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
     grad5 = _states_bptt_grad_np(alpha, beta, phi, levels, trends, y, d_forecast, multiplier, h)
     return value, _PACK_GRAD_BY_KIND[kind](grad5)
 
@@ -514,7 +595,9 @@ def _seasonal_states_np(
     for t in range(t_max):
         level, trend = levels[t], trends[t]
         s_old = season_bufs[t, 0]
-        if multiplicative:
+        if np.isnan(y[t]):  # missing observation (#34): skip the update, carry state forward
+            new_level, new_trend, new_season = level, trend, s_old
+        elif multiplicative:
             new_level = alpha * (y[t] / s_old) + (1 - alpha) * (level + phi * trend)
             new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
             new_season = gamma * (y[t] / new_level) + (1 - gamma) * s_old
@@ -634,6 +717,18 @@ def _seasonal_states_bptt_grad_np(
         gt = gt_direct[t] + gt_next
         gb = gb_direct[t] + gb_next
 
+        if np.isnan(y[t - 1]):
+            # Skipped step (#34): level/trend pass through unchanged, and the
+            # season buffer just rotates (s_old is re-appended as new_season
+            # verbatim) -- no param gradient, and s_old's only outgoing edge
+            # is that rotation, so its gradient is the incoming tail gradient.
+            gl_next, gt_next = gl, gt
+            next_gb = np.empty(m)
+            next_gb[0] = gb[-1]
+            next_gb[1:] = gb[:-1]
+            gb_next = next_gb
+            continue
+
         level_prev, trend_prev = levels[t - 1], trends[t - 1]
         s_old = season_bufs[t - 1, 0]
         y_prev = y[t - 1]
@@ -732,8 +827,9 @@ def _seasonal_objective_and_grad(
     n_origins = forecasts.shape[0]
     mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
     weight = _weight_matrix_np(sample_weight, n_origins, h) if sample_weight is not None else None
-    value = _loss_value_np(loss_key, actuals, forecasts, mask, weight)
-    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight)
+    actual_mask = _nan_actual_mask(actuals)
+    value = _loss_value_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
+    d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
     grad_tuple = _seasonal_states_bptt_grad_np(
         alpha,
         beta,
@@ -799,6 +895,7 @@ class Holt:
             raise ValueError(
                 f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
             )
+        _warn_and_validate_nan(y)
 
         loss_key = _loss_key(self.loss, self.delta, self.tau, self.alpha, self.p)
         custom = callable(loss_key)
@@ -865,7 +962,9 @@ class Holt:
 
         With very short series (few valid origins) this degenerates, e.g. a
         single origin gives 0 std and an all-zero-width interval -- accepted
-        as a known limitation rather than guarded against here.
+        as a known limitation rather than guarded against here. Likewise (#33),
+        a NaN gap wide enough to blank out every origin's actual at a given
+        horizon step gives that step a NaN std (and so a NaN interval).
         """
         assert self.params_ is not None  # called only from predict_interval(), already checked
         if self._kind in _SEASONAL_KINDS:
@@ -875,7 +974,9 @@ class Holt:
             )
         else:
             *_, forecasts, actuals = _holt_forward_np(self.params_, self._y, self.h, self._kind)
-        return np.std(actuals - forecasts, axis=0)
+        # nanstd (#33): a NaN actual contributes no residual, matching the
+        # same cells the fit's own joint loss zero-weights (_nan_actual_mask).
+        return np.nanstd(actuals - forecasts, axis=0)
 
     def predict_interval(
         self, coverage: float | list[float] | tuple[float, ...] = 0.9
@@ -993,6 +1094,7 @@ class HoltWinters(Holt):
                 "Series too short: need at least 2 * seasonal_period = "
                 f"{2 * m} points, got {len(y)}"
             )
+        _warn_and_validate_nan(y)
 
         loss_key = _loss_key(self.loss, self.delta, self.tau, self.alpha, self.p)
         custom = callable(loss_key)

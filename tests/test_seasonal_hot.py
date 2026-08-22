@@ -129,3 +129,67 @@ def test_fit_with_custom_loss_does_not_dispatch(monkeypatch: pytest.MonkeyPatch)
         h=3, seasonal_period=_M, n_starts=2, loss=lambda yt, yp: ((yt - yp) ** 2).mean()
     ).fit(y)
     assert not calls, "custom loss must not reach the compiled backend"
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("loss", _LOSSES)
+def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
+    """#36: the compiled seasonal core's skip-and-carry + NaN masking must match the NumPy path."""
+    rng = np.random.default_rng(_SEED[loss, kind] + 100)
+    multiplicative = kind in holt_module._MULTIPLICATIVE_KINDS
+    y = rng.uniform(15, 25, 40) if multiplicative else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[5] = np.nan
+    y[20] = np.nan
+    y[21] = np.nan
+    h = 5
+    params = _random_params(kind, rng, multiplicative)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
+
+    value_np, grad_np = holt_module._seasonal_objective_and_grad(params, y, h, kind, _M, loss_key)
+
+    alpha, beta, phi, gamma, level0, trend0, season0 = holt_module._UNPACK_SEASONAL_BY_KIND[kind](
+        params, _M
+    )
+    full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
+    value_c, grad_c_full = _holt_hot.seasonal_objective_and_grad(
+        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
+    )
+    grad_c = holt_module._PACK_GRAD_SEASONAL_BY_KIND[kind](
+        (
+            grad_c_full[0],
+            grad_c_full[1],
+            grad_c_full[2],
+            grad_c_full[3],
+            grad_c_full[4],
+            grad_c_full[5],
+            grad_c_full[6:],
+        )
+    )
+
+    assert value_c == pytest.approx(value_np, abs=1e-9)
+    np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
+
+
+@pytest.mark.parametrize("model_cls", [HoltWinters, DampedHoltWinters])
+@pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
+def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
+    model_cls: type, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#36: a NaN-containing y must still use the compiled backend, not fall back to NumPy."""
+    rng = np.random.default_rng(0)
+    y = (
+        rng.uniform(15, 25, 40)
+        if seasonal_type == "multiplicative"
+        else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    )
+    y[10] = np.nan
+    calls = []
+    real = _holt_hot.seasonal_objective_and_grad
+
+    def spy(*args: object, **kwargs: object) -> tuple[float, np.ndarray]:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
+    model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss="mse").fit(y)
+    assert calls, "fit() did not call the compiled backend for a NaN-containing y"

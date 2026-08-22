@@ -36,6 +36,12 @@ Custom callable losses are out of scope here (they stay on the NumPy path,
 per #18's `custom` branch in Holt.fit()/HoltWinters.fit()); these cores only
 serve the 9 built-ins.
 
+Missing values (#35/#36): a NaN in y is skip-and-carry in the recursion
+(mirrors _states_np/_seasonal_states_np) and zero-weighted in the joint loss
+whenever it lands in an actual (mirrors _nan_actual_mask), exactly like the
+NumPy path -- see holt.py for the reference semantics. No padding mask is
+involved (see below); NaN is the only per-element skip mechanism here.
+
 No padding mask (n_valid == len(y) always in the current codebase, so the
 mask is always all-True -- see the ADR from #21).
 
@@ -51,7 +57,7 @@ plain Python -- see tests/test_holt_hot.py and tests/test_seasonal_hot.py.
 """
 import numpy as np
 cimport numpy as np
-from libc.math cimport exp, fabs, fmax, fmin, log, log1p, pow, tanh
+from libc.math cimport exp, fabs, fmax, fmin, isnan, log, log1p, pow, tanh
 
 # Matches holt.py's _BOUND_EPS -- the floor forecasts are clamped to before
 # feeding a log/power (poisson/negbinom/tweedie deviances are undefined at
@@ -169,8 +175,12 @@ def objective_and_grad(
     for t in range(t_max):
         level = levels[t]
         trend = trends[t]
-        new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
-        new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
+        if isnan(y[t]):  # missing observation (#35): skip the update, carry state forward
+            new_level = level
+            new_trend = trend
+        else:
+            new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
+            new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
         levels[t + 1] = new_level
         trends[t + 1] = new_trend
 
@@ -180,16 +190,19 @@ def objective_and_grad(
 
     # forward + loss dispatch: forecasts[t, k] = levels[t] + multiplier[k] * trends[t],
     # actuals[t, k] = y[t+k]. Mirrors _loss_value_np/_loss_grad_np's per-name formulas.
-    cdef np.ndarray[np.float64_t, ndim=2] d_forecast = np.empty((n_origins, h))
-    cdef double n = n_origins * h
+    cdef np.ndarray[np.float64_t, ndim=2] d_forecast = np.zeros((n_origins, h))
+    cdef double n = 0.0  # count of non-NaN-actual cells (#35), not just n_origins * h
     cdef double loss = 0.0
     cdef double forecast, true, g
     for t in range(n_origins):
         for k in range(h):
-            forecast = levels[t] + multiplier[k] * trends[t]
             true = y[t + k]
+            if isnan(true):  # zero-weight this cell (#35): mirrors _nan_actual_mask
+                continue
+            forecast = levels[t] + multiplier[k] * trends[t]
             loss += _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
             d_forecast[t, k] = g
+            n += 1.0
     loss /= n
     for t in range(n_origins):
         for k in range(h):
@@ -221,6 +234,10 @@ def objective_and_grad(
     for t in range(n_origins - 1, 0, -1):
         gl_t = gl_direct[t] + gl_next
         gt_t = gt_direct[t] + gt_next
+        if isnan(y[t - 1]):  # skipped step (#35): identity backprop, no param gradient
+            gl_next = gl_t
+            gt_next = gt_t
+            continue
         level_prev = levels[t - 1]
         trend_prev = trends[t - 1]
         y_prev = y[t - 1]
@@ -285,7 +302,11 @@ def seasonal_objective_and_grad(
         level = levels[t]
         trend = trends[t]
         s_old = season_bufs[t, 0]
-        if multiplicative:
+        if isnan(y[t]):  # missing observation (#36): skip the update, carry state forward
+            new_level = level
+            new_trend = trend
+            new_season = s_old
+        elif multiplicative:
             new_level = alpha * (y[t] / s_old) + (1 - alpha) * (level + phi * trend)
             new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
             new_season = gamma * (y[t] / new_level) + (1 - gamma) * s_old
@@ -311,13 +332,16 @@ def seasonal_objective_and_grad(
     cdef np.ndarray[np.float64_t, ndim=1] gl_direct = np.zeros(n_origins)
     cdef np.ndarray[np.float64_t, ndim=1] gt_direct = np.zeros(n_origins)
     cdef np.ndarray[np.float64_t, ndim=2] gb_direct = np.zeros((n_origins, m))
-    cdef double n = n_origins * h
+    cdef double n = 0.0  # count of non-NaN-actual cells (#36), not just n_origins * h
     cdef double loss = 0.0
     cdef double forecast, true, g, trend_part_val, seasonal_part_val, mult_sum
     cdef double d_phi = 0.0
     for t in range(n_origins):
         mult_sum = 0.0
         for k in range(h):
+            true = y[t + k]
+            if isnan(true):  # zero-weight this cell (#36): mirrors _nan_actual_mask
+                continue
             trend_part_val = levels[t] + multiplier[k] * trends[t]
             j = k % m
             seasonal_part_val = season_bufs[t, j]
@@ -325,8 +349,8 @@ def seasonal_objective_and_grad(
                 forecast = trend_part_val * seasonal_part_val
             else:
                 forecast = trend_part_val + seasonal_part_val
-            true = y[t + k]
             loss += _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
+            n += 1.0
 
             if multiplicative:
                 gl_direct[t] += g * seasonal_part_val
@@ -367,6 +391,20 @@ def seasonal_objective_and_grad(
         gt = gt_direct[t] + gt_next
         for j in range(m):
             gb_cur[j] = gb_direct[t, j] + gb_next[j]
+
+        if isnan(y[t - 1]):
+            # Skipped step (#36): level/trend pass through unchanged, and the
+            # season buffer just rotates (s_old is re-appended as new_season
+            # verbatim) -- no param gradient, and s_old's only outgoing edge
+            # is that rotation, so its gradient is the incoming tail gradient.
+            gl_next = gl
+            gt_next = gt
+            next_gb[0] = gb_cur[m - 1]
+            for j in range(1, m):
+                next_gb[j] = gb_cur[j - 1]
+            for j in range(m):
+                gb_next[j] = next_gb[j]
+            continue
 
         level_prev = levels[t - 1]
         trend_prev = trends[t - 1]
