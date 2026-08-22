@@ -20,7 +20,7 @@ from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 from statsmodels.tsa.holtwinters import ExponentialSmoothing as SMExponentialSmoothing
 
 from benchmarks.datasets import Structure
-from multi_ets import SES, DampedHolt, DampedHoltWinters, Holt, HoltWinters
+from multi_ets import ExponentialSmoothing
 
 Adapter = Callable[[np.ndarray, int], np.ndarray]
 
@@ -50,13 +50,13 @@ def fitting_method_label(library: str, structure: Structure) -> str:
 
 
 def _multi_ets_model(structure: Structure, h: int, n_starts: int = 10):
+    trend = None if structure.trend == "none" else structure.trend
     if structure.seasonal == "none":
-        cls = {"none": SES, "add": Holt, "damped": DampedHolt}[structure.trend]
-        return cls(h=h, loss="mse", n_starts=n_starts)
-    cls = DampedHoltWinters if structure.damped else HoltWinters
+        return ExponentialSmoothing(h=h, trend=trend, loss="mse", n_starts=n_starts)
     seasonal_type = "additive" if structure.seasonal == "add" else "multiplicative"
-    return cls(
+    return ExponentialSmoothing(
         h=h,
+        trend=trend,
         seasonal_period=structure.seasonal_period,
         seasonal_type=seasonal_type,
         loss="mse",

@@ -12,7 +12,7 @@ import numpy as np
 import statsmodels.datasets as sm_datasets
 from statsmodels.tsa.holtwinters import Holt as SMHolt
 
-from multi_ets import Holt
+from multi_ets import ExponentialSmoothing
 
 # Classic Box-Jenkins AirPassengers monthly totals, Jan 1949 - Dec 1960.
 AIR_PASSENGERS = np.array(
@@ -185,7 +185,7 @@ def evaluate(y, h):
     y_train, y_test = y[:-h], y[-h:]
 
     t0 = time.perf_counter()
-    pred_ours = Holt(h=h, loss="mse").fit(y_train).predict()
+    pred_ours = ExponentialSmoothing(h=h, trend="add", loss="mse").fit(y_train).predict()
     t_ours = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -213,7 +213,7 @@ def benchmark_fit_speed(n_reps=5):
     times = []
     for _ in range(n_reps):
         t0 = time.perf_counter()
-        Holt(h=h, loss="mse", n_starts=10).fit(y)
+        ExponentialSmoothing(h=h, trend="add", loss="mse", n_starts=10).fit(y)
         times.append(time.perf_counter() - t0)
     return times
 

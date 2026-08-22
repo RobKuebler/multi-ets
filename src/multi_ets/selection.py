@@ -5,12 +5,12 @@ from typing import Any
 
 import numpy as np
 
-from multi_ets.holt import Holt, _loss_key, _loss_value_np, _nan_actual_mask
+from multi_ets.holt import ExponentialSmoothing, _loss_key, _loss_value_np, _nan_actual_mask
 
 
 def select_model(
-    candidates: Iterable[Holt], y: Any, n_splits: int
-) -> tuple[Holt, dict[Holt, float]]:
+    candidates: Iterable[ExponentialSmoothing], y: Any, n_splits: int
+) -> tuple[ExponentialSmoothing, dict[ExponentialSmoothing, float]]:
     """Pick the best of `candidates` by rolling-origin CV, each scored with its own loss/h.
 
     Split scheme: rolling-origin, expanding-window, non-overlapping, step =
@@ -21,7 +21,7 @@ def select_model(
     {candidate: mean_cv_loss} for every candidate.
     """
     y = np.asarray(y, dtype=float)
-    scores: dict[Holt, float] = {}
+    scores: dict[ExponentialSmoothing, float] = {}
     for candidate in candidates:
         loss_key = _loss_key(
             candidate.loss, candidate.delta, candidate.tau, candidate.alpha, candidate.p

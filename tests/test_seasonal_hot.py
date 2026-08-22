@@ -7,7 +7,7 @@ uv run python setup.py build_ext --inplace in src/multi_ets/, see setup.py).
 import numpy as np
 import pytest
 
-from multi_ets import DampedHoltWinters, HoltWinters
+from multi_ets import ExponentialSmoothing
 from multi_ets import holt as holt_module
 
 _holt_hot = pytest.importorskip("multi_ets._holt_hot")
@@ -85,10 +85,10 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
 
 
 @pytest.mark.parametrize("loss", _LOSSES)
-@pytest.mark.parametrize("model_cls", [HoltWinters, DampedHoltWinters])
+@pytest.mark.parametrize("trend", ["add", "damped"])
 @pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
 def test_fit_dispatches_to_compiled_backend(
-    model_cls: type, seasonal_type: str, loss: str, monkeypatch: pytest.MonkeyPatch
+    trend: str, seasonal_type: str, loss: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """fit() with a built-in loss must actually call the compiled seasonal_objective_and_grad.
 
@@ -111,7 +111,9 @@ def test_fit_dispatches_to_compiled_backend(
         return real(*args, **kwargs)
 
     monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
-    model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss=loss).fit(y)
+    ExponentialSmoothing(
+        h=3, trend=trend, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss=loss
+    ).fit(y)
     assert calls, "fit() did not call the compiled backend"
 
 
@@ -125,8 +127,12 @@ def test_fit_with_custom_loss_does_not_dispatch(monkeypatch: pytest.MonkeyPatch)
         "seasonal_objective_and_grad",
         lambda *a, **k: calls.append(1) or (0.0, np.zeros(5 + _M)),
     )
-    HoltWinters(
-        h=3, seasonal_period=_M, n_starts=2, loss=lambda yt, yp: ((yt - yp) ** 2).mean()
+    ExponentialSmoothing(
+        h=3,
+        trend="add",
+        seasonal_period=_M,
+        n_starts=2,
+        loss=lambda yt, yp: ((yt - yp) ** 2).mean(),
     ).fit(y)
     assert not calls, "custom loss must not reach the compiled backend"
 
@@ -170,10 +176,10 @@ def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
     np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
 
 
-@pytest.mark.parametrize("model_cls", [HoltWinters, DampedHoltWinters])
+@pytest.mark.parametrize("trend", ["add", "damped"])
 @pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
 def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
-    model_cls: type, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
+    trend: str, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#36: a NaN-containing y must still use the compiled backend, not fall back to NumPy."""
     rng = np.random.default_rng(0)
@@ -191,5 +197,7 @@ def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
         return real(*args, **kwargs)
 
     monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
-    model_cls(h=3, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss="mse").fit(y)
+    ExponentialSmoothing(
+        h=3, trend=trend, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss="mse"
+    ).fit(y)
     assert calls, "fit() did not call the compiled backend for a NaN-containing y"

@@ -1,6 +1,6 @@
 import numpy as np
 
-from multi_ets import SES, Holt, HoltWinters, select_model
+from multi_ets import ExponentialSmoothing, select_model
 
 
 def test_select_model_picks_seasonal_model_on_seasonal_data():
@@ -10,12 +10,12 @@ def test_select_model_picks_seasonal_model_on_seasonal_data():
     y = 20.0 + 1.5 * t + seasonal_true[t % m]
 
     candidates = [
-        SES(h=h, loss="mae"),
-        HoltWinters(h=h, seasonal_period=m, loss="mae", n_starts=8),
+        ExponentialSmoothing(h=h, loss="mae"),
+        ExponentialSmoothing(trend="add", h=h, seasonal_period=m, loss="mae", n_starts=8),
     ]
     best, scores = select_model(candidates, y, n_splits=3)
 
-    assert isinstance(best, HoltWinters)
+    assert best.seasonal_period is not None
     assert len(scores) == len(candidates)
     for candidate in candidates:
         assert candidate in scores
@@ -23,22 +23,22 @@ def test_select_model_picks_seasonal_model_on_seasonal_data():
 
 def test_select_model_refits_best_on_full_series():
     y = 3.0 + 2.0 * np.arange(40)
-    candidates = [SES(h=3, loss="mse")]
+    candidates = [ExponentialSmoothing(h=3, loss="mse")]
     best, _ = select_model(candidates, y, n_splits=2)
     assert np.allclose(best._y, y)
 
 
 def test_select_model_scores_custom_callable_loss_candidate():
-    # select_model must score a callable loss the same way SES/Holt.fit()
+    # select_model must score a callable loss the same way ExponentialSmoothing.fit()
     # itself does: by calling it directly, not via the (now-deleted)
     # jax-based _loss_fn_from_key.
     def weighted_mse(y_true, y_pred):
         return np.mean((y_pred - y_true) ** 2)
 
     y = 3.0 + 2.0 * np.arange(30)
-    candidates = [SES(h=3, loss=weighted_mse)]
+    candidates = [ExponentialSmoothing(h=3, loss=weighted_mse)]
     best, scores = select_model(candidates, y, n_splits=2)
-    assert isinstance(best, SES)
+    assert best.trend is None and best.seasonal_period is None
     assert scores[candidates[0]] >= 0.0
 
 
@@ -50,6 +50,6 @@ def test_select_model_ignores_nan_actual_in_a_cv_test_fold():
     y_gap = y.copy()
     y_gap[-1] = np.nan  # lands in the last split's test fold
 
-    candidates = [Holt(h=3, loss="mse")]
+    candidates = [ExponentialSmoothing(trend="add", h=3, loss="mse")]
     _, scores = select_model(candidates, y_gap, n_splits=2)
     assert np.isfinite(scores[candidates[0]])

@@ -850,21 +850,72 @@ def _seasonal_objective_and_grad(
     return value, _PACK_GRAD_SEASONAL_BY_KIND[kind](grad_tuple)
 
 
-class Holt:
-    """Holt's linear trend model (undamped, non-seasonal).
+# Number of box-constrained trend params (alpha, [beta,] [phi,] [gamma]) and
+# free (level0, [trend0]) params per _kind flat-params layout; shared by
+# ExponentialSmoothing.fit/_rescale_seasonal to build bounds/initial guesses
+# and locate level0/trend0/season0 in the flat vector without a kind-specific
+# subclass for each combination.
+_N_TREND_PARAMS = {
+    "ses": 1,
+    "undamped": 2,
+    "damped": 3,
+    "seasonal": 3,
+    "damped_seasonal": 4,
+    "seasonal_mult": 3,
+    "damped_seasonal_mult": 4,
+}
+_N_FREE_PARAMS = {  # 1 = level0 only; 2 = level0 + trend0
+    "ses": 1,
+    "undamped": 2,
+    "damped": 2,
+    "seasonal": 2,
+    "damped_seasonal": 2,
+    "seasonal_mult": 2,
+    "damped_seasonal_mult": 2,
+}
 
-    Parameters are fit jointly by minimizing the average forecast error across
-    every valid origin and every horizon step 1..h.
+
+def _resolve_kind(trend: str | None, seasonal_period: int | None, seasonal_type: str) -> str:
+    """(trend, seasonal_period, seasonal_type) -> internal _kind string.
+
+    trend=None + seasonal_period set is unsupported for now (added by a
+    follow-up ticket); every other combination maps onto the kind the old
+    SES/Holt/DampedHolt/HoltWinters/DampedHoltWinters classes used internally.
     """
+    if trend not in (None, "add", "damped"):
+        raise ValueError(f"Unknown trend {trend!r}; supported: None, 'add', 'damped'")
+    if seasonal_type not in ("additive", "multiplicative"):
+        raise ValueError(
+            f"Unknown seasonal_type {seasonal_type!r}; supported: 'additive', 'multiplicative'"
+        )
+    if seasonal_period is None:
+        return {None: "ses", "add": "undamped", "damped": "damped"}[trend]
+    if trend is None:
+        raise ValueError(
+            "trend=None with seasonal_period set is not supported yet "
+            "(no-trend seasonal models are a follow-up)"
+        )
+    kind = {"add": "seasonal", "damped": "damped_seasonal"}[trend]
+    return kind + "_mult" if seasonal_type == "multiplicative" else kind
 
-    _kind = "undamped"
-    _n_trend_params = 2  # alpha, beta
-    _n_free_params = 2  # level0, trend0
-    seasonal_period: int | None = None  # set by HoltWinters; read here by _resid_std
+
+class ExponentialSmoothing:
+    """Exponential smoothing, fit by minimizing a joint h-step-ahead loss.
+
+    trend=None (with seasonal_period=None) is simple exponential smoothing --
+    a flat forecast; trend="add"/"damped" adds an undamped/damped linear
+    trend; seasonal_period adds an additive or multiplicative (seasonal_type)
+    seasonal component on top of either trend. Parameters are fit jointly by
+    minimizing the average forecast error across every valid origin and every
+    horizon step 1..h.
+    """
 
     def __init__(
         self,
         h: int,
+        trend: str | None = None,
+        seasonal_period: int | None = None,
+        seasonal_type: str = "additive",
         loss: str | Callable[..., Any] = "mse",
         n_starts: int = 10,
         delta: float = 1.0,
@@ -873,7 +924,11 @@ class Holt:
         p: float = 1.5,
     ) -> None:
         _loss_key(loss, delta, tau, alpha, p)  # validate eagerly, re-resolved fresh in fit()
+        self._kind = _resolve_kind(trend, seasonal_period, seasonal_type)
         self.h = h
+        self.trend = trend
+        self.seasonal_period = seasonal_period
+        self.seasonal_type = seasonal_type
         self.loss = loss
         self.n_starts = n_starts
         self.delta = delta
@@ -883,7 +938,7 @@ class Holt:
         self.params_: np.ndarray | None = None
 
     def fit(self, y: Any, sample_weight: Any | None = None) -> Self:
-        """Fit alpha/beta/level0/trend0 by joint multi-start optimization; returns self.
+        """Fit smoothing/trend/seasonal params by joint multi-start optimization; returns self.
 
         sample_weight (#25), if given, is an array the same length as y that
         reweights each observation's contribution to the loss (e.g. for
@@ -891,9 +946,16 @@ class Holt:
         unweighted fit.
         """
         y = np.asarray(y, dtype=float)
+        seasonal = self._kind in _SEASONAL_KINDS
+        m = self.seasonal_period or 0  # 0: dummy, only ever read when seasonal is True
         if len(y) < self.h + 1:
             raise ValueError(
                 f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
+            )
+        if seasonal and len(y) < 2 * m:
+            raise ValueError(
+                "Series too short: need at least 2 * seasonal_period = "
+                f"{2 * m} points, got {len(y)}"
             )
         _warn_and_validate_nan(y)
 
@@ -903,16 +965,47 @@ class Holt:
             _validate_nonnegative_y(loss_key[0], y)
         n_valid = len(y)
         weight = _resolve_sample_weight(sample_weight, y, custom)
+        multiplicative = self._kind in _MULTIPLICATIVE_KINDS
 
         def objective(p: np.ndarray) -> Any:
             if custom:
                 # No hand-derived gradient for an arbitrary user loss; scipy's
                 # jac=False below falls back to its own finite-difference
                 # estimate. This whole fit path is plain NumPy -- no jax.
-                *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
+                if seasonal:
+                    forecasts, actuals = _seasonal_forward_np(p, y, self.h, self._kind, m)[-2:]
+                else:
+                    *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
                 return float(loss_key(actuals, forecasts))
             if _holt_hot is not None and weight is None and loss_key[0] in _LOSS_ID:
                 name, delta, tau, nb_alpha, tw_p = loss_key
+                if seasonal:
+                    alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
+                        self._kind
+                    ](p, m)
+                    full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
+                    value, grad_full = _holt_hot.seasonal_objective_and_grad(
+                        full,
+                        y,
+                        self.h,
+                        m,
+                        int(multiplicative),
+                        _LOSS_ID[name],
+                        delta,
+                        tau,
+                        nb_alpha,
+                        tw_p,
+                    )
+                    grad_tuple = (
+                        grad_full[0],
+                        grad_full[1],
+                        grad_full[2],
+                        grad_full[3],
+                        grad_full[4],
+                        grad_full[5],
+                        grad_full[6:],
+                    )
+                    return value, _PACK_GRAD_SEASONAL_BY_KIND[self._kind](grad_tuple)
                 full5 = np.asarray(_UNPACK_BY_KIND[self._kind](p), dtype=float)
                 value, grad5 = _holt_hot.objective_and_grad(
                     full5, y, self.h, _LOSS_ID[name], delta, tau, nb_alpha, tw_p
@@ -920,37 +1013,119 @@ class Holt:
                 return value, _PACK_GRAD_BY_KIND[self._kind](grad5)
             # ponytail: the compiled _holt_hot core doesn't take sample_weight
             # yet, so weighted fits always use the NumPy path; teach it to
-            # _holt_hot.objective_and_grad if weighted fits need the speedup.
+            # _holt_hot.objective_and_grad/seasonal_objective_and_grad if
+            # weighted fits need the speedup.
+            if seasonal:
+                return _seasonal_objective_and_grad(
+                    p, y, self.h, self._kind, m, loss_key, n_valid, weight
+                )
             return _holt_objective_and_grad(p, y, self.h, self._kind, loss_key, n_valid, weight)
 
-        # (level0, trend0) heuristic init; SES._n_free_params == 1 drops trend0.
-        free_guess = _heuristic_init(y)[: self._n_free_params]
-        lower = [_BOUND_EPS] * self._n_trend_params + [-np.inf] * self._n_free_params
-        upper = [1 - _BOUND_EPS] * self._n_trend_params + [np.inf] * self._n_free_params
-        if self._kind == "damped":
-            upper[2] = _PHI_UPPER  # phi: cap at the classical damping convention
-        bounds = list(zip(lower, upper, strict=True))
+        n_trend = _N_TREND_PARAMS[self._kind]
+        n_free = _N_FREE_PARAMS[self._kind]
+        if seasonal:
+            if multiplicative:
+                level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
+                    y, m
+                )
+                season_bounds = [(_BOUND_EPS, None)] * m
+            else:
+                level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init(y, m)
+                season_bounds = [(None, None)] * m
+            free_guess = [level0_guess, trend0_guess] if n_free == 2 else [level0_guess]
+            bounds = (
+                [(_BOUND_EPS, 1 - _BOUND_EPS)] * n_trend + [(None, None)] * n_free + season_bounds
+            )
+            if self._kind.startswith("damped"):
+                bounds[2] = (_BOUND_EPS, _PHI_UPPER)  # phi: cap at the classical damping convention
 
-        best = None
-        for start in _start_grid(self.n_starts, self._n_trend_params):
-            x0 = np.concatenate([start, free_guess])
-            result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
-            if best is None or result.fun < best.fun:
-                best = result
+            best = None
+            for start in _start_grid(self.n_starts, n_trend):
+                x0 = np.concatenate([start, free_guess, season0_guess])
+                result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
+                if best is None or result.fun < best.fun:
+                    best = result
+        else:
+            free_guess = _heuristic_init(y)[:n_free]
+            lower = [_BOUND_EPS] * n_trend + [-np.inf] * n_free
+            upper = [1 - _BOUND_EPS] * n_trend + [np.inf] * n_free
+            if self._kind == "damped":
+                upper[2] = _PHI_UPPER  # phi: cap at the classical damping convention
+            bounds = list(zip(lower, upper, strict=True))
+
+            best = None
+            for start in _start_grid(self.n_starts, n_trend):
+                x0 = np.concatenate([start, free_guess])
+                result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
+                if best is None or result.fun < best.fun:
+                    best = result
 
         assert best is not None  # _start_grid always yields at least one start
         self.params_ = best.x
         self._y = y
+        if seasonal:
+            self._rescale_seasonal()
         return self
 
     def predict(self) -> np.ndarray:
-        """Forecast the next self.h steps from the fitted level/trend."""
+        """Forecast the next self.h steps from the fitted state."""
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
-        alpha, beta, level0, trend0 = self.params_
-        levels, trends = _states_np(alpha, beta, 1.0, level0, trend0, self._y)
+        if self._kind in _SEASONAL_KINDS:
+            m = self.seasonal_period or 0  # 0: dummy, unreachable since we're in a seasonal kind
+            multiplicative = self._kind in _MULTIPLICATIVE_KINDS
+            alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[self._kind](
+                self.params_, m
+            )
+            levels, trends, season_bufs = _seasonal_states_np(
+                alpha, beta, phi, gamma, level0, trend0, season0, self._y, m, multiplicative
+            )
+            level, trend = float(levels[-1]), float(trends[-1])
+            multiplier = _forecast_multiplier_np(phi, self.h)
+            seasonal_vals = np.asarray(season_bufs[-1])[np.arange(self.h) % m]
+            trend_part = level + multiplier * trend
+            return trend_part * seasonal_vals if multiplicative else trend_part + seasonal_vals
+        # Unified formula: for "ses", beta/phi/trend0 are all pinned to 0, so
+        # multiplier is all-zero and this collapses to a flat level repeat.
+        alpha, beta, phi, level0, trend0 = _UNPACK_BY_KIND[self._kind](self.params_)
+        levels, trends = _states_np(alpha, beta, phi, level0, trend0, self._y)
         level, trend = float(levels[-1]), float(trends[-1])
-        return level + np.arange(1, self.h + 1) * trend
+        multiplier = _forecast_multiplier_np(phi, self.h)
+        return level + multiplier * trend
+
+    def _rescale_seasonal(self) -> None:
+        """Rescale seasonal factors to a canonical mean, without changing any forecast.
+
+        Additive: shift seasonal factors to mean 0, folding the removed
+        mean into level0. Both updates are convex combinations of (y_t - s)
+        and (level + s), so a uniform +c/-c shift cancels through the whole
+        recursion and leaves every forecast unchanged.
+
+        Multiplicative: scale seasonal factors to mean 1, folding the removed
+        scale into level0 (and trend0, for a kind that has one). Scaling
+        season by 1/c and (level, trend) by c leaves every one of level_t,
+        trend_t, season_t scaled by the same c (by induction: level_t =
+        alpha*(y_t/s_old) + (1-alpha)*(level+phi*trend) scales by c when
+        s_old scales by 1/c and (level, trend) scale by c; trend_t is a
+        difference of levels so it scales by c too; season_t =
+        gamma*(y_t/level_t) + (1-gamma)*s_old scales by 1/c by the same
+        argument). Forecasts are (level + multiplier*trend) * seasonal, i.e.
+        c * (1/c) = 1, so they're unchanged.
+        """
+        assert self.params_ is not None  # only called from fit(), right after it's set
+        m = self.seasonal_period or 0  # 0: dummy, unreachable -- only called for a seasonal kind
+        n = _N_TREND_PARAMS[self._kind]
+        nf = _N_FREE_PARAMS[self._kind]
+        season0 = self.params_[n + nf : n + nf + m]
+        c = season0.mean()
+        if self._kind in _MULTIPLICATIVE_KINDS:
+            self.params_[n] *= c
+            if nf == 2:
+                self.params_[n + 1] *= c
+            self.params_[n + nf : n + nf + m] /= c
+        else:
+            self.params_[n] += c
+            self.params_[n + nf : n + nf + m] -= c
 
     def _resid_std(self) -> np.ndarray:
         """Per-horizon-step std of (actual - forecast) across every valid training origin.
@@ -968,9 +1143,9 @@ class Holt:
         """
         assert self.params_ is not None  # called only from predict_interval(), already checked
         if self._kind in _SEASONAL_KINDS:
-            assert self.seasonal_period is not None  # set by HoltWinters for seasonal kinds
+            m = self.seasonal_period or 0  # 0: dummy, unreachable since we're in a seasonal kind
             *_, forecasts, actuals = _seasonal_forward_np(
-                self.params_, self._y, self.h, self._kind, self.seasonal_period
+                self.params_, self._y, self.h, self._kind, m
             )
         else:
             *_, forecasts, actuals = _holt_forward_np(self.params_, self._y, self.h, self._kind)
@@ -998,233 +1173,3 @@ class Holt:
         if isinstance(coverage, (list, tuple)):
             return {c: bounds(c) for c in coverage}
         return bounds(coverage)
-
-
-class SES(Holt):
-    """Simple exponential smoothing: a flat (no trend) forecast.
-
-    alpha and level0 are fit jointly against the same joint h-step loss as
-    Holt; beta/phi/trend0 are pinned to 0 so the recursion collapses to plain
-    SES and every forecast horizon step returns the same level.
-    """
-
-    _kind = "ses"
-    _n_trend_params = 1  # alpha
-    _n_free_params = 1  # level0
-
-    def predict(self) -> np.ndarray:
-        """Forecast the next self.h steps as a flat repeat of the fitted level."""
-        if self.params_ is None:
-            raise ValueError("Model is not fitted yet; call .fit(y) first")
-        alpha, level0 = self.params_
-        levels, _ = _states_np(alpha, 0.0, 0.0, level0, 0.0, self._y)
-        return np.full(self.h, float(levels[-1]))
-
-
-class DampedHolt(Holt):
-    """Holt's linear trend model with a damped trend (non-seasonal).
-
-    Adds a box-constrained damping parameter phi in (0, 1), jointly optimized
-    alongside alpha/beta against the same joint h-step loss as Holt.
-    """
-
-    _kind = "damped"
-    _n_trend_params = 3  # alpha, beta, phi
-
-    def predict(self) -> np.ndarray:
-        """Forecast the next self.h steps from the fitted level/trend/damping."""
-        if self.params_ is None:
-            raise ValueError("Model is not fitted yet; call .fit(y) first")
-        alpha, beta, phi, level0, trend0 = self.params_
-        levels, trends = _states_np(alpha, beta, phi, level0, trend0, self._y)
-        level, trend = float(levels[-1]), float(trends[-1])
-        multiplier = _forecast_multiplier_np(phi, self.h)
-        return level + multiplier * trend
-
-
-class HoltWinters(Holt):
-    """Holt-Winters: Holt's linear trend plus additive or multiplicative seasonality.
-
-    Seasonal factors s_1..s_m (the initial cycle) are free parameters
-    (box-constrained to stay positive when seasonal_type="multiplicative"),
-    jointly optimized alongside alpha/beta/gamma/level0/trend0 against the
-    same joint h-step loss as Holt. phi is fixed at 1.0 (undamped trend).
-    """
-
-    _kind = "seasonal"
-    _n_trend_params = 3  # alpha, beta, gamma
-    seasonal_period: int  # narrows Holt's int | None: always set by this subclass's __init__
-
-    def __init__(
-        self,
-        h: int,
-        seasonal_period: int,
-        seasonal_type: str = "additive",
-        loss: str | Callable[..., Any] = "mse",
-        n_starts: int = 10,
-        delta: float = 1.0,
-        tau: float = 0.5,
-        alpha: float = 1.0,
-        p: float = 1.5,
-    ) -> None:
-        super().__init__(h, loss=loss, n_starts=n_starts, delta=delta, tau=tau, alpha=alpha, p=p)
-        if seasonal_type not in ("additive", "multiplicative"):
-            raise ValueError(
-                f"Unknown seasonal_type {seasonal_type!r}; supported: 'additive', 'multiplicative'"
-            )
-        self.seasonal_period = seasonal_period
-        self.seasonal_type = seasonal_type
-        if seasonal_type == "multiplicative":
-            self._kind = self._kind + "_mult"
-
-    def fit(self, y: Any, sample_weight: Any | None = None) -> Self:
-        """Fit trend and seasonal params by joint multi-start optimization; returns self.
-
-        sample_weight: see Holt.fit.
-        """
-        y = np.asarray(y, dtype=float)
-        m = self.seasonal_period
-        multiplicative = self.seasonal_type == "multiplicative"
-        if len(y) < self.h + 1:
-            raise ValueError(
-                f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
-            )
-        if len(y) < 2 * m:
-            raise ValueError(
-                "Series too short: need at least 2 * seasonal_period = "
-                f"{2 * m} points, got {len(y)}"
-            )
-        _warn_and_validate_nan(y)
-
-        loss_key = _loss_key(self.loss, self.delta, self.tau, self.alpha, self.p)
-        custom = callable(loss_key)
-        if not custom:
-            _validate_nonnegative_y(loss_key[0], y)
-        n_valid = len(y)
-        weight = _resolve_sample_weight(sample_weight, y, custom)
-
-        def objective(p: np.ndarray) -> Any:
-            if custom:
-                # No hand-derived gradient for an arbitrary user loss; scipy's
-                # jac=False below falls back to its own finite-difference
-                # estimate. This whole fit path is plain NumPy -- no jax.
-                forecasts, actuals = _seasonal_forward_np(p, y, self.h, self._kind, m)[-2:]
-                return float(loss_key(actuals, forecasts))
-            if _holt_hot is not None and weight is None and loss_key[0] in _LOSS_ID:
-                name, delta, tau, nb_alpha, tw_p = loss_key
-                alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
-                    self._kind
-                ](p, m)
-                full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
-                value, grad_full = _holt_hot.seasonal_objective_and_grad(
-                    full,
-                    y,
-                    self.h,
-                    m,
-                    int(multiplicative),
-                    _LOSS_ID[name],
-                    delta,
-                    tau,
-                    nb_alpha,
-                    tw_p,
-                )
-                grad_tuple = (
-                    grad_full[0],
-                    grad_full[1],
-                    grad_full[2],
-                    grad_full[3],
-                    grad_full[4],
-                    grad_full[5],
-                    grad_full[6:],
-                )
-                return value, _PACK_GRAD_SEASONAL_BY_KIND[self._kind](grad_tuple)
-            # ponytail: see the non-seasonal fit() -- weighted fits skip the
-            # compiled core and always use the NumPy path.
-            return _seasonal_objective_and_grad(
-                p, y, self.h, self._kind, m, loss_key, n_valid, weight
-            )
-
-        if multiplicative:
-            level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init_multiplicative(
-                y, m
-            )
-            season_bounds = [(_BOUND_EPS, None)] * m
-        else:
-            level0_guess, trend0_guess, season0_guess = _heuristic_seasonal_init(y, m)
-            season_bounds = [(None, None)] * m
-        bounds = (
-            [(_BOUND_EPS, 1 - _BOUND_EPS)] * self._n_trend_params
-            + [(None, None), (None, None)]
-            + season_bounds
-        )
-        if self._kind.startswith("damped"):
-            bounds[2] = (_BOUND_EPS, _PHI_UPPER)  # phi: cap at the classical damping convention
-
-        best = None
-        for start in _start_grid(self.n_starts, self._n_trend_params):
-            x0 = np.concatenate([start, [level0_guess, trend0_guess], season0_guess])
-            result = minimize(objective, x0, method="L-BFGS-B", jac=not custom, bounds=bounds)
-            if best is None or result.fun < best.fun:
-                best = result
-
-        assert best is not None  # _start_grid always yields at least one start
-        self.params_ = best.x
-        self._y = y
-        self._rescale_seasonal()
-        return self
-
-    def _rescale_seasonal(self) -> None:
-        """Rescale seasonal factors to a canonical mean, without changing any forecast.
-
-        Additive: shift seasonal factors to mean 0, folding the removed
-        mean into level0. Both updates are convex combinations of (y_t - s)
-        and (level + s), so a uniform +c/-c shift cancels through the whole
-        recursion and leaves every forecast unchanged.
-
-        Multiplicative: scale seasonal factors to mean 1, folding the removed
-        scale into level0 and trend0. Scaling season by 1/c and (level, trend)
-        by c leaves every one of level_t, trend_t, season_t scaled by the same
-        c (by induction: level_t = alpha*(y_t/s_old) + (1-alpha)*(level+phi*trend)
-        scales by c when s_old scales by 1/c and (level, trend) scale by c;
-        trend_t is a difference of levels so it scales by c too; season_t =
-        gamma*(y_t/level_t) + (1-gamma)*s_old scales by 1/c by the same
-        argument). Forecasts are (level + multiplier*trend) * seasonal, i.e.
-        c * (1/c) = 1, so they're unchanged.
-        """
-        assert self.params_ is not None  # only called from fit(), right after it's set
-        m = self.seasonal_period
-        n = self._n_trend_params
-        season0 = self.params_[n + 2 : n + 2 + m]
-        c = season0.mean()
-        if self.seasonal_type == "multiplicative":
-            self.params_[n] *= c
-            self.params_[n + 1] *= c
-            self.params_[n + 2 : n + 2 + m] /= c
-        else:
-            self.params_[n] += c
-            self.params_[n + 2 : n + 2 + m] -= c
-
-    def predict(self) -> np.ndarray:
-        """Forecast the next self.h steps from the fitted level/trend/seasonal factors."""
-        if self.params_ is None:
-            raise ValueError("Model is not fitted yet; call .fit(y) first")
-        m = self.seasonal_period
-        multiplicative = self.seasonal_type == "multiplicative"
-        alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[self._kind](
-            self.params_, m
-        )
-        levels, trends, season_bufs = _seasonal_states_np(
-            alpha, beta, phi, gamma, level0, trend0, season0, self._y, m, multiplicative
-        )
-        level, trend = float(levels[-1]), float(trends[-1])
-        multiplier = _forecast_multiplier_np(phi, self.h)
-        seasonal = np.asarray(season_bufs[-1])[np.arange(self.h) % m]
-        trend_part = level + multiplier * trend
-        return trend_part * seasonal if multiplicative else trend_part + seasonal
-
-
-class DampedHoltWinters(HoltWinters):
-    """Holt-Winters with additive or multiplicative seasonality and a damped trend."""
-
-    _kind = "damped_seasonal"
-    _n_trend_params = 4  # alpha, beta, phi, gamma
