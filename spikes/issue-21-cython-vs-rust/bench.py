@@ -104,29 +104,29 @@ def time_it(fn, *args, n_reps: int) -> tuple[float, float]:
     return first, min(reps) if reps else first
 
 
-def bench_many_tiny(impl_name: str, fit_fn) -> None:
+def bench_many_tiny(impl_name: str, fit_fn, n_starts: int) -> None:
     def run_many():
         for i in range(N_FITS_PER_TRIAL):
             y = make_series(40, seed=i)
-            fit_fn(y, h=3, n_starts=5)
+            fit_fn(y, h=3, n_starts=n_starts)
 
     first, best = time_it(run_many, n_reps=N_TRIALS_MANY)
     print(
-        f"{impl_name:13s} many-tiny ({N_FITS_PER_TRIAL} fits, n=40, h=3, n_starts=5): "
+        f"{impl_name:13s} many-tiny ({N_FITS_PER_TRIAL} fits, n=40, h=3, n_starts={n_starts}): "
         f"first={first:7.3f}s  min={best:7.3f}s  "
         f"({1000 * best / N_FITS_PER_TRIAL:.3f} ms/fit)"
     )
 
 
-def bench_one_long(impl_name: str, fit_fn) -> None:
+def bench_one_long(impl_name: str, fit_fn, n_starts: int) -> None:
     y = make_series(700, seed=0)
 
     def run_one():
-        fit_fn(y, h=45, n_starts=10)
+        fit_fn(y, h=45, n_starts=n_starts)
 
     first, best = time_it(run_one, n_reps=N_TRIALS_LONG)
     print(
-        f"{impl_name:13s} one-long  (n=700, h=45, n_starts=10): "
+        f"{impl_name:13s} one-long  (n=700, h=45, n_starts={n_starts}): "
         f"first={first:7.3f}s  min={best:7.3f}s"
     )
 
@@ -155,6 +155,8 @@ IMPLS = [
 
 if __name__ == "__main__":
     sanity_check()
+
+    print("=== multi_ets's real config (n_starts=5/10) vs. statsmodels/statsforecast ===")
     print(
         "note: statsmodels/statsforecast fit a single classical 1-step-SSE model,\n"
         "no multistart -- included as a wall-clock speed reference only, not an\n"
@@ -162,7 +164,21 @@ if __name__ == "__main__":
         'CONTEXT.md\'s "Matched-structure comparison" entry).\n'
     )
     for name, fn in IMPLS:
-        bench_many_tiny(name, fn)
+        bench_many_tiny(name, fn, n_starts=5)
     print()
     for name, fn in IMPLS:
-        bench_one_long(name, fn)
+        bench_one_long(name, fn, n_starts=10)
+
+    print("\n=== apples-to-apples: numpy/cython/rust forced to n_starts=1 ===")
+    print(
+        "note: still not fully equivalent -- multi_ets is still minimizing a joint\n"
+        "multi-step loss (h forecast steps per origin) vs. statsmodels/statsforecast's\n"
+        "1-step SSE, and still pays one scipy.optimize.minimize call's overhead that\n"
+        "statsmodels/statsforecast's own (different) solvers don't. This isolates the\n"
+        "multistart-loop's contribution, not the remaining differences.\n"
+    )
+    for name, fn in IMPLS:
+        bench_many_tiny(name, fn, n_starts=1)
+    print()
+    for name, fn in IMPLS:
+        bench_one_long(name, fn, n_starts=1)

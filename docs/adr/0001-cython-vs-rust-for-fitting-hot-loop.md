@@ -156,6 +156,42 @@ inefficient for what it's actually solving; it's solving a harder problem
 CONTEXT.md's "Multi-step joint loss" entry), and that's orthogonal to
 whether its implementation is compiled or interpreted.
 
+### Closer to apples-to-apples: forcing multi_ets to `n_starts=1`
+
+The comparison above conflates two things multi_ets does differently:
+solving a harder objective (joint multi-step loss, non-convex) *and* solving
+it 5-10 times (multistart) instead of once. Re-running with `numpy`/
+`cython`/`rust` forced to `n_starts=1` — a single fit, same as statsmodels/
+statsforecast always do — isolates how much of the earlier gap was really
+the multistart loop:
+
+| impl          | many-tiny ms/fit (n_starts=1) | one-long (n_starts=1) |
+|---------------|------------------------------:|-----------------------:|
+| numpy         | 19.3                          | 0.186 s                 |
+| cython        | 2.7                           | 0.007 s                 |
+| rust          | 2.5                           | 0.008 s                 |
+| statsmodels   | 21.5                          | 0.041 s                 |
+| statsforecast | 1.6                           | 0.015 s                 |
+
+At a single start, the compiled multi_ets prototypes **beat statsmodels
+outright** on both shapes, and beat statsforecast on the one-long shape
+(0.007-0.008 s vs. 0.015 s) while staying within ~1.6x of it on many-tiny.
+Even the plain NumPy baseline lands in the same ballpark as statsmodels once
+the ×5-10 multistart multiplier is removed (19.3 ms vs. 21.5 ms/fit).
+
+Still not fully apples-to-apples — multi_ets is still minimizing a joint
+h-step loss via `scipy.optimize.minimize`, not statsmodels/statsforecast's
+own (different, and for SES-like cases non-iterative) solvers — but this
+isolates the real culprit: **almost all of the earlier gap vs. classical
+libraries was the multistart loop, not the joint multi-step loss itself or
+interpreter overhead.** `n_starts=10` (or even 5) is expensive precisely
+*because* it's 10 (or 5) full optimizer runs; that cost is inherent to
+wanting multistart's robustness against local optima (see
+`test_multi_start_beats_single_start` in `tests/test_holt.py` for why
+multi_ets uses it at all), not something a compiled hot loop removes for
+free — a compiled hot loop makes each of those N restarts cheap, but N
+restarts of a compiled function is still N restarts.
+
 ## Decision
 
 **A compiled hot loop is clearly worth it if this is ever shipped — and,
