@@ -23,7 +23,9 @@ def select_model(
     y = np.asarray(y, dtype=float)
     scores: dict[Holt, float] = {}
     for candidate in candidates:
-        loss_key = _loss_key(candidate.loss, candidate.delta, candidate.tau)
+        loss_key = _loss_key(
+            candidate.loss, candidate.delta, candidate.tau, candidate.alpha, candidate.p
+        )
         h = candidate.h
         if len(y) < n_splits * h:
             raise ValueError(

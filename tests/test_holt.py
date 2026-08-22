@@ -172,6 +172,7 @@ def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, 
     rng = np.random.default_rng(0)
     h = 3
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
+    y = y - y.min() + 5.0  # poisson/negbinom/tweedie need non-negative y; don't rely on luck
     loss_key = (loss_name, delta, tau, 1.0, 1.5)
 
     p = rng.uniform(0.1, 0.9, n_params)
@@ -250,8 +251,10 @@ def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, d
     m = 4
     multiplicative = kind in holt_module._MULTIPLICATIVE_KINDS
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
-    if multiplicative:
-        y = y - y.min() + 5.0  # keep the series positive for y_t/level, y_t/s_old
+    # Always keep y positive: multiplicative kinds need it for y_t/level, y_t/s_old, and
+    # poisson/negbinom/tweedie need a non-negative y regardless of kind -- don't rely on
+    # the unshifted random walk happening to stay positive for those rows.
+    y = y - y.min() + 5.0
     loss_key = (loss_name, delta, tau, 1.0, 1.5)
     p = _rand_seasonal_params(rng, kind, m, multiplicative)
 

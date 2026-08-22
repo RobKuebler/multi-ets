@@ -6,6 +6,7 @@ from typing import Any, Self
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.special import xlogy
 from scipy.stats import norm
 
 try:
@@ -252,13 +253,13 @@ def _loss_value_np(
         return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask, weight)
     if name == "poisson":
         mu = np.maximum(y_pred, _BOUND_EPS)
-        dev = 2.0 * (np.where(y_true > 0, y_true * np.log(y_true / mu), 0.0) - (y_true - mu))
+        dev = 2.0 * (xlogy(y_true, y_true / mu) - (y_true - mu))
         return _masked_mean_np(dev, mask, weight)
     if name == "negbinom":
         alpha = loss_key[3]
         mu = np.maximum(y_pred, _BOUND_EPS)
         dev = 2.0 * (
-            np.where(y_true > 0, y_true * np.log(y_true / mu), 0.0)
+            xlogy(y_true, y_true / mu)
             - (y_true + 1.0 / alpha) * np.log((1.0 + alpha * y_true) / (1.0 + alpha * mu))
         )
         return _masked_mean_np(dev, mask, weight)
