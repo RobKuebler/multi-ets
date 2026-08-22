@@ -19,10 +19,10 @@ import holt_hot_rs
 
 from multi_ets.holt import Holt, _holt_objective_and_grad
 
-N_TRIALS_MANY = 3  # repeats of the "many tiny fits" shape
+N_TRIALS_MANY = 5  # repeats of the "many tiny fits" shape
 N_FITS_PER_TRIAL = 200  # ticket says "~1000 fits in a loop"; scaled down 5x for spike turnaround,
 # per-fit overhead ratios don't change with the loop's length -- see the ADR
-N_TRIALS_LONG = 5  # repeats of the "one long fit" shape
+N_TRIALS_LONG = 15  # repeats of the "one long fit" shape
 
 
 def make_series(n: int, seed: int) -> np.ndarray:
@@ -66,14 +66,33 @@ def fit_cython(y: np.ndarray, h: int, n_starts: int) -> np.ndarray:
 
 def fit_rust(y: np.ndarray, h: int, n_starts: int) -> np.ndarray:
     def obj(p, y_, h_):
-        loss, grad = holt_hot_rs.objective_and_grad(list(p), list(y_), h_)
+        # y_ passed straight through as a numpy array -- PyReadonlyArray1 on the
+        # Rust side borrows its buffer with no copy, unlike the list(y_) this
+        # used to do (see the "how is cython so much faster" follow-up in the ADR).
+        loss, grad = holt_hot_rs.objective_and_grad(list(p), y_, h_)
         return loss, np.array(grad)
 
     return _multistart(obj, y, h, n_starts)
 
 
+def fit_statsmodels(y: np.ndarray, h: int, n_starts: int) -> None:
+    from statsmodels.tsa.holtwinters import Holt as SMHolt
+
+    SMHolt(y, initialization_method="estimated", damped_trend=False).fit(optimized=True)
+
+
+def fit_statsforecast(y: np.ndarray, h: int, n_starts: int) -> None:
+    from statsforecast.models import Holt as SFHolt
+
+    SFHolt().fit(y)
+
+
 def time_it(fn, *args, n_reps: int) -> tuple[float, float]:
-    """(first_call_s, median_of_remaining_s)."""
+    """(first_call_s, min_of_remaining_s). min, not median: this is a shared desktop
+
+    machine (browser + other processes contending for CPU), and min is far less
+    sensitive to contention pauses than median for a handful of short reps.
+    """
     t0 = time.perf_counter()
     fn(*args)
     first = time.perf_counter() - t0
@@ -82,7 +101,7 @@ def time_it(fn, *args, n_reps: int) -> tuple[float, float]:
         t0 = time.perf_counter()
         fn(*args)
         reps.append(time.perf_counter() - t0)
-    return first, float(np.median(reps)) if reps else first
+    return first, min(reps) if reps else first
 
 
 def bench_many_tiny(impl_name: str, fit_fn) -> None:
@@ -91,11 +110,11 @@ def bench_many_tiny(impl_name: str, fit_fn) -> None:
             y = make_series(40, seed=i)
             fit_fn(y, h=3, n_starts=5)
 
-    first, median = time_it(run_many, n_reps=N_TRIALS_MANY)
+    first, best = time_it(run_many, n_reps=N_TRIALS_MANY)
     print(
-        f"{impl_name:8s} many-tiny ({N_FITS_PER_TRIAL} fits, n=40, h=3, n_starts=5): "
-        f"first={first:7.3f}s  median={median:7.3f}s  "
-        f"({1000 * median / N_FITS_PER_TRIAL:.3f} ms/fit)"
+        f"{impl_name:13s} many-tiny ({N_FITS_PER_TRIAL} fits, n=40, h=3, n_starts=5): "
+        f"first={first:7.3f}s  min={best:7.3f}s  "
+        f"({1000 * best / N_FITS_PER_TRIAL:.3f} ms/fit)"
     )
 
 
@@ -105,10 +124,10 @@ def bench_one_long(impl_name: str, fit_fn) -> None:
     def run_one():
         fit_fn(y, h=45, n_starts=10)
 
-    first, median = time_it(run_one, n_reps=N_TRIALS_LONG)
+    first, best = time_it(run_one, n_reps=N_TRIALS_LONG)
     print(
-        f"{impl_name:8s} one-long  (n=700, h=45, n_starts=10):                 "
-        f"first={first:7.3f}s  median={median:7.3f}s"
+        f"{impl_name:13s} one-long  (n=700, h=45, n_starts=10): "
+        f"first={first:7.3f}s  min={best:7.3f}s"
     )
 
 
@@ -118,7 +137,7 @@ def sanity_check() -> None:
     params = np.array([0.3, 0.2, y[0], 0.1])
     loss_np, grad_np = _holt_objective_and_grad(params, y, h, "undamped", ("mse", 1.0, 0.5))
     loss_cy, grad_cy = holt_hot.objective_and_grad(params, y, h)
-    loss_rs, grad_rs = holt_hot_rs.objective_and_grad(list(params), list(y), h)
+    loss_rs, grad_rs = holt_hot_rs.objective_and_grad(list(params), y, h)
     np.testing.assert_allclose(loss_cy, loss_np, atol=1e-10)
     np.testing.assert_allclose(grad_cy, grad_np, atol=1e-10)
     np.testing.assert_allclose(loss_rs, loss_np, atol=1e-10)
@@ -126,10 +145,24 @@ def sanity_check() -> None:
     print("sanity check: cython and rust objective+grad match the numpy baseline (atol=1e-10)\n")
 
 
+IMPLS = [
+    ("numpy", fit_numpy),
+    ("cython", fit_cython),
+    ("rust", fit_rust),
+    ("statsmodels", fit_statsmodels),
+    ("statsforecast", fit_statsforecast),
+]
+
 if __name__ == "__main__":
     sanity_check()
-    for name, fn in [("numpy", fit_numpy), ("cython", fit_cython), ("rust", fit_rust)]:
+    print(
+        "note: statsmodels/statsforecast fit a single classical 1-step-SSE model,\n"
+        "no multistart -- included as a wall-clock speed reference only, not an\n"
+        "apples-to-apples comparison with multi_ets's multi-step joint loss (see\n"
+        'CONTEXT.md\'s "Matched-structure comparison" entry).\n'
+    )
+    for name, fn in IMPLS:
         bench_many_tiny(name, fn)
     print()
-    for name, fn in [("numpy", fit_numpy), ("cython", fit_cython), ("rust", fit_rust)]:
+    for name, fn in IMPLS:
         bench_one_long(name, fn)
