@@ -180,12 +180,6 @@ class Structure:
             raise ValueError(f"Unknown trend {self.trend!r}")
         if self.seasonal not in ("none", "add", "mul"):
             raise ValueError(f"Unknown seasonal {self.seasonal!r}")
-        if self.seasonal == "none" and self.trend == "none":
-            return
-        if self.seasonal != "none" and self.trend == "none":
-            # multi_ets has no seasonal-without-trend class (HoltWinters always
-            # includes a trend term), so this combination isn't representable.
-            raise ValueError("multi_ets has no trend='none' + seasonal!='none' structure")
         if self.seasonal != "none" and self.seasonal_period is None:
             raise ValueError("seasonal structures need a seasonal_period")
 

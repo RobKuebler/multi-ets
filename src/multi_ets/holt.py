@@ -151,16 +151,28 @@ def _UNPACK_DAMPED_SEASONAL(p: Any, m: int) -> tuple[Any, ...]:
     return (p[0], p[1], p[2], p[3], p[4], p[5], p[6 : 6 + m])
 
 
+# No-trend seasonal (#38): reuses the seasonal engine by pinning beta=0,
+# phi=1.0, trend0=0 -- the same trick _UNPACK_SES uses on the non-seasonal
+# engine. Flat layout: alpha, gamma, level0, season0[0..m-1] (2 trend params,
+# 1 free param -- no trend0 slot).
+def _UNPACK_SEASONAL_NO_TREND(p: Any, m: int) -> tuple[Any, ...]:
+    return (p[0], 0.0, 1.0, p[1], p[2], 0.0, p[3 : 3 + m])
+
+
 # "_mult" kinds share the same flat-params layout/unpack as their additive
 # counterpart; only the recursion and combine-op (see _joint_loss_seasonal) differ.
 _UNPACK_SEASONAL_BY_KIND = {
     "seasonal": _UNPACK_SEASONAL,
     "damped_seasonal": _UNPACK_DAMPED_SEASONAL,
+    "seasonal_no_trend": _UNPACK_SEASONAL_NO_TREND,
     "seasonal_mult": _UNPACK_SEASONAL,
     "damped_seasonal_mult": _UNPACK_DAMPED_SEASONAL,
+    "seasonal_no_trend_mult": _UNPACK_SEASONAL_NO_TREND,
 }
 _SEASONAL_KINDS = frozenset(_UNPACK_SEASONAL_BY_KIND)
-_MULTIPLICATIVE_KINDS = frozenset({"seasonal_mult", "damped_seasonal_mult"})
+_MULTIPLICATIVE_KINDS = frozenset(
+    {"seasonal_mult", "damped_seasonal_mult", "seasonal_no_trend_mult"}
+)
 
 
 def _heuristic_init(y: Any) -> tuple[float, float]:
@@ -781,13 +793,22 @@ def _pack_grad_damped_seasonal(
     return np.concatenate([[d_alpha, d_beta, d_phi, d_gamma, d_level0, d_trend0], d_season0])
 
 
+def _pack_grad_seasonal_no_trend(
+    d: tuple[float, float, float, float, float, float, np.ndarray],
+) -> np.ndarray:
+    d_alpha, _d_beta, _d_phi, d_gamma, d_level0, _d_trend0, d_season0 = d
+    return np.concatenate([[d_alpha, d_gamma, d_level0], d_season0])
+
+
 # "_mult" kinds share the additive kind's flat-params layout and gradient
 # packing (see _UNPACK_SEASONAL_BY_KIND); only the recursion differs.
 _PACK_GRAD_SEASONAL_BY_KIND = {
     "seasonal": _pack_grad_seasonal,
     "damped_seasonal": _pack_grad_damped_seasonal,
+    "seasonal_no_trend": _pack_grad_seasonal_no_trend,
     "seasonal_mult": _pack_grad_seasonal,
     "damped_seasonal_mult": _pack_grad_damped_seasonal,
+    "seasonal_no_trend_mult": _pack_grad_seasonal_no_trend,
 }
 
 
@@ -859,8 +880,10 @@ _N_TREND_PARAMS = {
     "ses": 1,
     "undamped": 2,
     "damped": 3,
+    "seasonal_no_trend": 2,
     "seasonal": 3,
     "damped_seasonal": 4,
+    "seasonal_no_trend_mult": 2,
     "seasonal_mult": 3,
     "damped_seasonal_mult": 4,
 }
@@ -868,8 +891,10 @@ _N_FREE_PARAMS = {  # 1 = level0 only; 2 = level0 + trend0
     "ses": 1,
     "undamped": 2,
     "damped": 2,
+    "seasonal_no_trend": 1,
     "seasonal": 2,
     "damped_seasonal": 2,
+    "seasonal_no_trend_mult": 1,
     "seasonal_mult": 2,
     "damped_seasonal_mult": 2,
 }
@@ -878,9 +903,9 @@ _N_FREE_PARAMS = {  # 1 = level0 only; 2 = level0 + trend0
 def _resolve_kind(trend: str | None, seasonal_period: int | None, seasonal_type: str) -> str:
     """(trend, seasonal_period, seasonal_type) -> internal _kind string.
 
-    trend=None + seasonal_period set is unsupported for now (added by a
-    follow-up ticket); every other combination maps onto the kind the old
-    SES/Holt/DampedHolt/HoltWinters/DampedHoltWinters classes used internally.
+    Every combination maps onto the kind the old SES/Holt/DampedHolt/
+    HoltWinters/DampedHoltWinters classes used internally, plus the
+    no-trend seasonal kind added by #38.
     """
     if trend not in (None, "add", "damped"):
         raise ValueError(f"Unknown trend {trend!r}; supported: None, 'add', 'damped'")
@@ -890,12 +915,7 @@ def _resolve_kind(trend: str | None, seasonal_period: int | None, seasonal_type:
         )
     if seasonal_period is None:
         return {None: "ses", "add": "undamped", "damped": "damped"}[trend]
-    if trend is None:
-        raise ValueError(
-            "trend=None with seasonal_period set is not supported yet "
-            "(no-trend seasonal models are a follow-up)"
-        )
-    kind = {"add": "seasonal", "damped": "damped_seasonal"}[trend]
+    kind = {None: "seasonal_no_trend", "add": "seasonal", "damped": "damped_seasonal"}[trend]
     return kind + "_mult" if seasonal_type == "multiplicative" else kind
 
 

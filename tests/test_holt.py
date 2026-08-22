@@ -219,6 +219,9 @@ def test_hand_derived_grad_matches_finite_difference_with_sample_weight():
 def _rand_seasonal_params(rng, kind, m, multiplicative):
     season0 = rng.uniform(0.5, 1.5, m) if multiplicative else rng.uniform(-1.0, 1.0, m)
     level0, trend0 = rng.uniform(-1.0, 1.0, 2)
+    if kind.startswith("seasonal_no_trend"):
+        alpha, gamma = rng.uniform(0.1, 0.9, 2)
+        return np.concatenate([[alpha, gamma, level0], season0])
     if kind.startswith("damped"):
         alpha, beta, gamma = rng.uniform(0.1, 0.9, 3)
         phi = rng.uniform(0.1, holt_module._PHI_UPPER)  # exercise up to the classical damping cap
@@ -242,7 +245,15 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
     ],
 )
 @pytest.mark.parametrize(
-    "kind", ["seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult"]
+    "kind",
+    [
+        "seasonal",
+        "damped_seasonal",
+        "seasonal_no_trend",
+        "seasonal_mult",
+        "damped_seasonal_mult",
+        "seasonal_no_trend_mult",
+    ],
 )
 def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, delta, tau):
     # ExponentialSmoothing.fit()'s hand-derived seasonal BPTT
@@ -548,6 +559,116 @@ def test_holt_winters_multiplicative_seasonal_factors_mean_one_and_rescale_invar
 def test_holt_winters_unknown_seasonal_type_raises():
     with pytest.raises(ValueError, match="Unknown seasonal_type"):
         ExponentialSmoothing(trend="add", h=4, seasonal_period=4, seasonal_type="bogus")
+
+
+# --- Seasonal without a trend term (#38) ---
+
+
+def test_seasonal_no_trend_predict_returns_h_forecasts():
+    m, h = 4, 4
+    t = np.arange(20)
+    y = 20.0 + np.tile([1.0, -1.0, 2.0, -2.0], 5)[t]
+    forecasts = ExponentialSmoothing(h=h, seasonal_period=m, loss="mse").fit(y).predict()
+    assert np.shape(forecasts) == (h,)
+
+
+def test_seasonal_no_trend_kind_defaults_to_no_trend():
+    model = ExponentialSmoothing(h=4, seasonal_period=4)
+    assert model.trend is None
+    assert model._kind == "seasonal_no_trend"
+
+
+def test_seasonal_no_trend_recovers_flat_level_and_seasonal_pattern():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y_full = 20.0 + seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+
+    forecasts = (
+        ExponentialSmoothing(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y_fit).predict()
+    )
+    np.testing.assert_allclose(forecasts, y_future, atol=0.5)
+
+
+def test_seasonal_no_trend_multiplicative_recovers_seasonal_pattern():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y_full = 20.0 * seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+
+    forecasts = (
+        ExponentialSmoothing(
+            h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse", n_starts=8
+        )
+        .fit(y_fit)
+        .predict()
+    )
+    np.testing.assert_allclose(forecasts, y_future, atol=0.5)
+
+
+def test_seasonal_no_trend_seasonal_factors_mean_zero_and_rescale_invariant():
+    m, h = 4, 4
+    t = np.arange(20)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y = 20.0 + seasonal_true[t % m]
+
+    model = ExponentialSmoothing(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y)
+    # params_ layout: alpha, gamma, level0, s_0..s_{m-1}
+    season = model.params_[3 : 3 + m]
+    np.testing.assert_allclose(season.mean(), 0.0, atol=1e-6)
+
+    forecasts = model.predict()
+    c = 7.3  # arbitrary shift: -c into level0, +c into every seasonal factor
+    model.params_[2] -= c
+    model.params_[3 : 3 + m] += c
+    np.testing.assert_allclose(model.predict(), forecasts, atol=1e-8)
+
+
+def test_seasonal_no_trend_multiplicative_seasonal_factors_mean_one():
+    m, h = 4, 4
+    t = np.arange(20)
+    seasonal_true = np.array([1.2, 0.8, 0.9, 1.1])
+    y = 20.0 * seasonal_true[t % m]
+
+    model = ExponentialSmoothing(
+        h=h, seasonal_period=m, seasonal_type="multiplicative", loss="mse", n_starts=8
+    ).fit(y)
+    season = model.params_[3 : 3 + m]
+    np.testing.assert_allclose(season.mean(), 1.0, atol=1e-6)
+    assert np.all(season > 0)
+
+
+def test_seasonal_no_trend_predict_interval_works():
+    m, h = 4, 4
+    t = np.arange(20)
+    y = 20.0 + np.tile([5.0, -3.0, -4.0, 2.0], 5)[t]
+    model = ExponentialSmoothing(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y)
+    lower, upper = model.predict_interval(coverage=0.9)
+    point = model.predict()
+    assert np.all(lower <= point) and np.all(point <= upper)
+
+
+def test_seasonal_no_trend_fits_with_interior_nan_gap():
+    m, h = 4, 4
+    t = np.arange(44)
+    seasonal_true = np.array([5.0, -3.0, -4.0, 2.0])
+    y_full = 20.0 + seasonal_true[t % m]
+    y_fit, y_future = y_full[:-h], y_full[-h:]
+    y_gap = y_fit.copy()
+    y_gap[10] = np.nan
+
+    forecasts = (
+        ExponentialSmoothing(h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y_gap).predict()
+    )
+    np.testing.assert_allclose(forecasts, y_future, atol=1.0)
+
+
+def test_trend_none_with_seasonal_period_no_longer_raises():
+    # Regression guard for #38: this combination used to be rejected outright.
+    model = ExponentialSmoothing(h=3, trend=None, seasonal_period=4)
+    assert model._kind in ("seasonal_no_trend", "seasonal_no_trend_mult")
 
 
 def test_ses_predict_returns_h_forecasts():
