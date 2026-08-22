@@ -4,7 +4,7 @@ Exponential smoothing (Holt, Holt-Winters) fit by minimizing a **joint multi-ste
 
 Most ETS implementations fit `alpha`/`beta`/`gamma`/... to minimize one-step-ahead residuals, then hope the recursion also forecasts well `h` steps out. Here, the loss is computed jointly across every valid forecast origin and every horizon step `1..h`, so the fitted parameters are the ones that actually minimize the error you care about: the multi-step forecast.
 
-Built on [JAX](https://github.com/jax-ml/jax) for autodiff + `jit`, with multi-start [L-BFGS-B](https://github.com/google/jaxopt) to deal with the resulting loss surface's local optima.
+Fit with hand-derived gradients and multi-start [L-BFGS-B](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-lbfgsb.html) (via `scipy.optimize.minimize`) to deal with the resulting loss surface's local optima.
 
 ## Install
 
@@ -69,7 +69,7 @@ forecasts = best.predict()
 
 ### Loss
 
-All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+ `tau`), or any callable `(y_true, y_pred) -> scalar` written in `jax.numpy`.
+All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+ `tau`), or any callable `(y_true, y_pred) -> scalar` written in plain NumPy.
 
 ```python
 Holt(h=5, loss="huber", delta=2.0).fit(y).predict()
@@ -78,7 +78,7 @@ Holt(h=5, loss=lambda yt, yp: (yt - yp).var()).fit(y).predict()
 
 ### Multi-start
 
-Fitting is non-convex, so each model restarts from `n_starts` (default 10) points spread across the parameter box and keeps the best. All restarts for `Holt`/`DampedHolt` run as a single `jax.vmap`'d batched solve rather than a Python loop.
+Fitting is non-convex, so each model restarts from `n_starts` (default 10) points spread across the parameter box and keeps the best, via a plain Python loop over `scipy.optimize.minimize`.
 
 ## Model overview
 

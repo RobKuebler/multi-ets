@@ -26,3 +26,17 @@ def test_select_model_refits_best_on_full_series():
     candidates = [SES(h=3, loss="mse")]
     best, _ = select_model(candidates, y, n_splits=2)
     assert np.allclose(best._y, y)
+
+
+def test_select_model_scores_custom_callable_loss_candidate():
+    # select_model must score a callable loss the same way SES/Holt.fit()
+    # itself does: by calling it directly, not via the (now-deleted)
+    # jax-based _loss_fn_from_key.
+    def weighted_mse(y_true, y_pred):
+        return np.mean((y_pred - y_true) ** 2)
+
+    y = 3.0 + 2.0 * np.arange(30)
+    candidates = [SES(h=3, loss=weighted_mse)]
+    best, scores = select_model(candidates, y, n_splits=2)
+    assert isinstance(best, SES)
+    assert scores[candidates[0]] >= 0.0

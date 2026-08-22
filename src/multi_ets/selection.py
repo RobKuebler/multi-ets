@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from multi_ets.holt import Holt, _loss_fn_from_key, _loss_key
+from multi_ets.holt import Holt, _loss_key, _loss_value_np
 
 
 def select_model(
@@ -23,7 +23,7 @@ def select_model(
     y = np.asarray(y, dtype=float)
     scores: dict[Holt, float] = {}
     for candidate in candidates:
-        loss_fn = _loss_fn_from_key(_loss_key(candidate.loss, candidate.delta, candidate.tau))
+        loss_key = _loss_key(candidate.loss, candidate.delta, candidate.tau)
         h = candidate.h
         if len(y) < n_splits * h:
             raise ValueError(
@@ -35,7 +35,11 @@ def select_model(
             cutoff = len(y) - (n_splits - split) * h
             train, test = y[:cutoff], y[cutoff : cutoff + h]
             candidate.fit(train)
-            losses.append(float(loss_fn(test, candidate.predict())))
+            pred = candidate.predict()
+            loss = (
+                loss_key(test, pred) if callable(loss_key) else _loss_value_np(loss_key, test, pred)
+            )
+            losses.append(float(loss))
         scores[candidate] = float(np.mean(losses))
 
     best = min(scores, key=lambda c: scores[c])

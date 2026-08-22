@@ -8,10 +8,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.4",
     "scipy>=1.11",
     "numpy>=1.26",
-    "jaxopt>=0.8.5",
 ]
 
 [dependency-groups]
@@ -39,8 +37,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "NPY", "D", "ANN"]
-# ANN401: this module deliberately types jax/numpy duck-typed values as Any
-# rather than chasing precise jax stubs that don't buy much at this size.
+# ANN401: this module deliberately types numpy-duck-typed values as Any
+# rather than chasing precise stubs that don't buy much at this size.
 ignore = ["ANN401"]
 
 [tool.ruff.lint.pydocstyle]

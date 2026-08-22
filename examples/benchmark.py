@@ -201,19 +201,14 @@ def evaluate(y, h):
 
 
 def benchmark_fit_speed(n_reps=5):
-    """Repeated .fit() calls on a warm cache: isolates dispatch overhead from
-    one-time JIT compilation. Before/after the switch from a sequential
-    Python for-loop over n_starts restarts (scipy.optimize.minimize per
-    restart) to a single jax.vmap'd multi-start L-BFGS-B solve:
+    """Repeated .fit() calls on a fixed series: steady-state per-call fit time.
 
-        before (sequential restarts): median ~0.28s  (0.26s-0.31s over 5 reps)
-        after  (vmapped restarts):    median ~0.02s  (~13x faster)
+    Each call runs a plain Python loop over n_starts scipy.optimize.minimize
+    restarts (see Holt.fit()) -- no compilation step to warm up here.
     """
     rng = np.random.default_rng(0)
     y = np.cumsum(rng.normal(0.5, 1.0, 100)) + 20
     h = 10
-
-    Holt(h=h, loss="mse", n_starts=10).fit(y)  # warm-up: pay JIT compile once
 
     times = []
     for _ in range(n_reps):
@@ -236,7 +231,7 @@ def main():
         )
 
     print()
-    print("fit() speed, 100-point series, h=10, n_starts=10 (warm JIT cache):")
+    print("fit() speed, 100-point series, h=10, n_starts=10:")
     fit_times = benchmark_fit_speed()
     print("  " + ", ".join(f"{t:.4f}s" for t in fit_times))
     print(f"  median: {sorted(fit_times)[len(fit_times) // 2]:.4f}s")

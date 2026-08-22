@@ -1,9 +1,6 @@
-import functools
-
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy.optimize import approx_fprime
 from statsmodels.tsa.holtwinters import Holt as SMHolt
 
 from multi_ets import SES, DampedHolt, DampedHoltWinters, Holt, HoltWinters
@@ -101,7 +98,7 @@ def test_pinball_tau_orders_forecasts():
 
 def test_custom_callable_loss_is_used_to_fit():
     def weighted_mse(y_true, y_pred):
-        return jnp.mean((y_pred - y_true) ** 2)
+        return np.mean((y_pred - y_true) ** 2)
 
     y = 3.0 + 2.0 * np.arange(30)
     forecasts = Holt(h=5, loss=weighted_mse).fit(y).predict()
@@ -114,55 +111,28 @@ def test_custom_callable_loss_is_used_to_fit():
     [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
-def test_hand_derived_grad_matches_jax_autodiff(kind, n_params, loss_name, delta, tau):
-    # #18: Holt.fit()'s hand-derived BPTT gradient (_holt_objective_and_grad)
-    # must agree with the JAX autodiff gradient it replaces, for every
-    # built-in loss and every non-seasonal kind (undamped/damped/ses).
+def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, delta, tau):
+    # Holt.fit()'s hand-derived BPTT gradient (_holt_objective_and_grad) must
+    # agree with a finite-difference approximation, for every built-in loss
+    # and every non-seasonal kind (undamped/damped/ses). #18/#19 cross-checked
+    # this against JAX autodiff while migrating off it; #20 drops jax as a
+    # dependency entirely, so this is now the permanent regression check.
     rng = np.random.default_rng(0)
     h = 3
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
-    unpack = holt_module._UNPACK_BY_KIND[kind]
     loss_key = (loss_name, delta, tau)
-    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
 
     p = rng.uniform(0.1, 0.9, n_params)
     if kind == "damped":
         p[2] = min(p[2], 0.9)  # phi < 1, matching the classical damping range
 
-    def jax_loss(params):
-        return holt_module._joint_loss(params, jnp.asarray(y), h, loss_fn_jax, unpack)
+    def value(params):
+        return holt_module._holt_objective_and_grad(params, y, h, kind, loss_key)[0]
 
-    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
     _, grad = holt_module._holt_objective_and_grad(p, y, h, kind, loss_key)
+    numeric_grad = approx_fprime(p, value, 1e-6)
 
-    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
-
-
-def test_hand_derived_grad_matches_jax_autodiff_with_padding():
-    # Holt.fit() always fits on a bucket-padded, masked series (_pad_to_bucket)
-    # -- the branch above never exercises, since it never passes n_valid. That
-    # masked branch is the one every real .fit() call actually uses, so it
-    # needs its own jax-vs-numpy cross-check.
-    rng = np.random.default_rng(1)
-    h = 3
-    y = np.cumsum(rng.normal(0, 1, 13)) + 10  # 13 -> pads to 16
-    y_padded = holt_module._pad_to_bucket(y)
-    assert len(y_padded) > len(y)  # sanity: this length actually needs padding
-    kind = "undamped"
-    unpack = holt_module._UNPACK_BY_KIND[kind]
-    loss_key = ("mse", 1.0, 0.5)
-    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
-    p = rng.uniform(0.1, 0.9, 4)
-
-    def jax_loss(params):
-        return holt_module._joint_loss(
-            params, jnp.asarray(y_padded), h, loss_fn_jax, unpack, n_valid=len(y)
-        )
-
-    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
-    _, grad = holt_module._holt_objective_and_grad(p, y_padded, h, kind, loss_key, n_valid=len(y))
-
-    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
+    np.testing.assert_allclose(grad, numeric_grad, atol=1e-4, rtol=1e-4)
 
 
 def _rand_seasonal_params(rng, kind, m, multiplicative):
@@ -183,11 +153,12 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
 @pytest.mark.parametrize(
     "kind", ["seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult"]
 )
-def test_seasonal_hand_derived_grad_matches_jax_autodiff(kind, loss_name, delta, tau):
-    # #19: HoltWinters/DampedHoltWinters.fit()'s hand-derived seasonal BPTT
-    # gradient (_seasonal_objective_and_grad) must agree with the JAX autodiff
-    # gradient it replaces, for every built-in loss, additive+multiplicative,
-    # undamped+damped.
+def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, delta, tau):
+    # HoltWinters/DampedHoltWinters.fit()'s hand-derived seasonal BPTT
+    # gradient (_seasonal_objective_and_grad) must agree with a
+    # finite-difference approximation, for every built-in loss,
+    # additive+multiplicative, undamped+damped (see the non-seasonal
+    # counterpart above for why this replaced a JAX-autodiff cross-check).
     rng = np.random.default_rng(2)
     h = 3
     m = 4
@@ -195,52 +166,16 @@ def test_seasonal_hand_derived_grad_matches_jax_autodiff(kind, loss_name, delta,
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
     if multiplicative:
         y = y - y.min() + 5.0  # keep the series positive for y_t/level, y_t/s_old
-    unpack = holt_module._UNPACK_SEASONAL_BY_KIND[kind]
     loss_key = (loss_name, delta, tau)
-    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
     p = _rand_seasonal_params(rng, kind, m, multiplicative)
 
-    def jax_loss(params):
-        return holt_module._joint_loss_seasonal(
-            params, jnp.asarray(y), h, loss_fn_jax, unpack, m, multiplicative
-        )
+    def value(params):
+        return holt_module._seasonal_objective_and_grad(params, y, h, kind, m, loss_key)[0]
 
-    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
     _, grad = holt_module._seasonal_objective_and_grad(p, y, h, kind, m, loss_key)
+    numeric_grad = approx_fprime(p, value, 1e-6)
 
-    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
-
-
-@pytest.mark.parametrize("kind", ["seasonal", "damped_seasonal"])
-def test_seasonal_hand_derived_grad_matches_jax_autodiff_with_padding(kind):
-    # HoltWinters.fit()/DampedHoltWinters.fit() fit additive kinds on a
-    # bucket-padded, masked series (_pad_to_bucket) -- the parametrized test
-    # above never exercises this, since it never passes n_valid. That masked
-    # branch is the one every real additive .fit() call actually uses (both
-    # undamped and damped), so it needs its own jax-vs-numpy cross-check
-    # (mirrors test_hand_derived_grad_matches_jax_autodiff_with_padding).
-    rng = np.random.default_rng(3)
-    h = 3
-    m = 4
-    y = np.cumsum(rng.normal(0, 1, 13)) + 10  # 13 -> pads to 16
-    y_padded = holt_module._pad_to_bucket(y)
-    assert len(y_padded) > len(y)  # sanity: this length actually needs padding
-    unpack = holt_module._UNPACK_SEASONAL_BY_KIND[kind]
-    loss_key = ("mse", 1.0, 0.5)
-    loss_fn_jax = holt_module._loss_fn_from_key(loss_key)
-    p = _rand_seasonal_params(rng, kind, m, multiplicative=False)
-
-    def jax_loss(params):
-        return holt_module._joint_loss_seasonal(
-            params, jnp.asarray(y_padded), h, loss_fn_jax, unpack, m, n_valid=len(y)
-        )
-
-    jax_grad = np.asarray(jax.grad(jax_loss)(jnp.asarray(p)))
-    _, grad = holt_module._seasonal_objective_and_grad(
-        p, y_padded, h, kind, m, loss_key, n_valid=len(y)
-    )
-
-    np.testing.assert_allclose(grad, jax_grad, atol=1e-6)
+    np.testing.assert_allclose(grad, numeric_grad, atol=1e-4, rtol=1e-4)
 
 
 def test_unknown_loss_raises():
@@ -512,111 +447,3 @@ def test_attribute_set_after_construction_is_honored_at_fit():
 
     direct = Holt(h=5, loss="huber", delta=20.0).fit(y)
     np.testing.assert_allclose(model.params_, direct.params_)
-
-
-def test_compiled_multistart_cache_stays_bounded_across_many_lengths(monkeypatch):
-    # Regression test for #15: fitting many distinct training lengths (as a
-    # rolling-origin backtest does) must not grow the compiled-closure cache
-    # without bound -- each length beyond the cache's maxsize should evict an
-    # older one rather than accumulate forever. Swaps in a maxsize=2 cache
-    # (same underlying builder) so the eviction behavior can be proven with a
-    # handful of real compiles instead of _COMPILE_CACHE_SIZE + 1 of them.
-    #
-    # Calls _compiled_multistart directly rather than through SES.fit(): as of
-    # #18, nothing in this module calls this JAX-jaxopt cache any more (it's
-    # fully dead code, left in place until #20 deletes it); this test still
-    # exercises the cache's own eviction behavior, which is otherwise untested.
-    def _build(h, loss_key, kind, n):  # mirrors _compiled_multistart_cached's signature
-        return holt_module._compile_multistart(h, loss_key, kind)
-
-    small_cache = functools.lru_cache(maxsize=2)(_build)
-    monkeypatch.setattr(holt_module, "_compiled_multistart_cached", small_cache)
-
-    loss_key = holt_module._loss_key("mse", 1.0, 0.5)
-    for length in range(5, 9):  # 4 distinct lengths through a maxsize=2 cache
-        holt_module._compiled_multistart(1, loss_key, "ses", length)
-
-    assert small_cache.cache_info().currsize <= 2
-
-
-def test_bucket_length_is_smallest_power_of_two_at_least_n():
-    assert holt_module._bucket_length(1) == 1
-    assert holt_module._bucket_length(5) == 8
-    assert holt_module._bucket_length(8) == 8
-    assert holt_module._bucket_length(9) == 16
-
-
-def test_pad_to_bucket_repeats_last_value_and_is_a_noop_at_a_power_of_two():
-    padded = holt_module._pad_to_bucket(np.array([1.0, 2.0, 3.0]))
-    np.testing.assert_array_equal(padded, [1.0, 2.0, 3.0, 3.0])
-
-    y8 = np.arange(8.0)
-    assert holt_module._pad_to_bucket(y8) is y8  # already a bucket length: no-op
-
-
-def test_padded_joint_loss_is_bit_exact_with_unpadded():
-    # Correctness bar for #17: padding a training array to a bucket length
-    # and masking out the padded origins must reproduce the unpadded joint
-    # loss bit-for-bit, not just approximately -- fitted params must not move.
-    y = np.linspace(-1.0, 2.0, 13)  # 13 -> pads to 16
-    h = 3
-    unpack = holt_module._UNPACK_BY_KIND["undamped"]
-    loss_fn = holt_module._loss_fn_from_key(holt_module._loss_key("mse", 1.0, 0.5))
-    params = np.array([0.3, 0.2, 5.0, 1.0])
-
-    unpadded = holt_module._joint_loss(params, jnp.asarray(y), h, loss_fn, unpack)
-
-    y_padded = holt_module._pad_to_bucket(y)
-    assert len(y_padded) > len(y)  # sanity: this length actually needs padding
-    padded = holt_module._joint_loss(
-        params, jnp.asarray(y_padded), h, loss_fn, unpack, n_valid=len(y)
-    )
-
-    assert padded == unpadded
-
-
-def test_expanding_window_refits_share_one_compiled_shape(monkeypatch):
-    # Regression test for #17: rolling-origin backtests refit at every
-    # expanding-window length (n, n+h, n+2h, ...), and each distinct length
-    # used to force a fresh XLA compile since a fresh length never repeats
-    # within one backtest. Bucketing to the next power of two means every
-    # length in [5, 8] now shares bucket 8, so this cache should see the same
-    # single entry hit on every refit after the first.
-    #
-    # Simulates the bucketing + cache lookup directly rather than through
-    # SES.fit(): as of #18, SES/Holt/DampedHolt no longer pass a bucketed
-    # length into this JAX-jaxopt cache themselves (it's dead code from their
-    # side now, kept alive only until #20 deletes it); this test still
-    # exercises the cache's own bucket-sharing behavior, which is otherwise
-    # untested.
-    def _build(h, loss_key, kind, n):  # mirrors _compiled_multistart_cached's signature
-        return holt_module._compile_multistart(h, loss_key, kind)
-
-    small_cache = functools.lru_cache(maxsize=2)(_build)
-    monkeypatch.setattr(holt_module, "_compiled_multistart_cached", small_cache)
-
-    loss_key = holt_module._loss_key("mse", 1.0, 0.5)
-    for length in range(5, 9):  # expanding window: 5, 6, 7, 8
-        bucket_len = len(holt_module._pad_to_bucket(np.linspace(0, 1, length)))
-        holt_module._compiled_multistart(1, loss_key, "ses", bucket_len)
-
-    assert small_cache.cache_info().hits >= 3  # only the first length misses
-    assert small_cache.cache_info().currsize == 1
-
-
-def test_multiplicative_seasonal_fit_skips_bucket_padding(monkeypatch):
-    # Regression test: the multiplicative seasonal recursion (y_t/s_old,
-    # y_t/level) is a ratio, not a convex combination like every other kind,
-    # so it isn't provably bounded the way the additive/non-seasonal kinds
-    # are (spectral radius < 1 everywhere in the alpha/beta/(phi) box).
-    # Direct simulation confirms it blows up toward +-inf/0 well within
-    # float64 range at plausible multi-start corners when iterated hundreds
-    # of steps beyond the real series length -- exactly what bucket-padding
-    # would do -- so #17's padding must never apply here.
-    def _boom(y):
-        raise AssertionError("must not bucket-pad a multiplicative-seasonal fit")
-
-    monkeypatch.setattr(holt_module, "_pad_to_bucket", _boom)
-    y = 10.0 + 0.1 * np.arange(30) + np.tile([1.0, 1.2, 0.8], 10)
-    model = HoltWinters(h=2, seasonal_period=3, seasonal_type="multiplicative", n_starts=2).fit(y)
-    assert np.all(np.isfinite(model.params_))

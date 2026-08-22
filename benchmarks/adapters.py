@@ -27,7 +27,7 @@ Adapter = Callable[[np.ndarray, int], np.ndarray]
 # for why those aren't the same fitting philosophy).
 def fitting_method_label(library: str, structure: Structure) -> str:
     if library == "multi_ets":
-        return "multi-step SSE (JAX)"
+        return "multi-step SSE"
     if library == "statsmodels":
         return "1-step SSE (classical)"
     if library == "statsforecast":

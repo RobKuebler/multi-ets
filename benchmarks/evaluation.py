@@ -1,12 +1,11 @@
-"""Rolling-origin backtest (MSE) + a small JIT cold/warm timing footnote for multi_ets."""
+"""Rolling-origin backtest (MSE) for multi_ets, statsmodels, statsforecast."""
 
 import time
 from dataclasses import dataclass
 
 import numpy as np
 
-from benchmarks.adapters import Adapter, _multi_ets_model
-from benchmarks.datasets import Structure, make_synthetic
+from benchmarks.adapters import Adapter
 
 N_SPLITS = 3
 HORIZONS = (1, 6, 12)
@@ -46,24 +45,3 @@ def backtest(
         fold_times.append(time.perf_counter() - t0)
         fold_mses.append(float(np.mean((np.asarray(pred) - test) ** 2)))
     return BacktestResult(mse=float(np.mean(fold_mses)), fold_mses=fold_mses, fold_times=fold_times)
-
-
-def multi_ets_jit_overhead(
-    structure: Structure, h: int, length: int = 150, n_reps: int = 5, seed: int = 0
-) -> tuple[float, float]:
-    """(cold_fit_time, warm_median_fit_time) for one (structure, h): isolates JAX's one-time
-    JIT compile cost from steady-state dispatch, on a fixed-shape series so the JIT cache
-    actually gets reused across the repeats (mirrors examples/benchmark.py::benchmark_fit_speed).
-    """
-    y = make_synthetic(structure, length=length, seed=seed)
-
-    t0 = time.perf_counter()
-    _multi_ets_model(structure, h).fit(y)
-    cold = time.perf_counter() - t0
-
-    warm_times = []
-    for _ in range(n_reps):
-        t0 = time.perf_counter()
-        _multi_ets_model(structure, h).fit(y)
-        warm_times.append(time.perf_counter() - t0)
-    return cold, float(np.median(warm_times))

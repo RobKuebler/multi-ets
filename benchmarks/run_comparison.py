@@ -12,19 +12,10 @@ import pandas as pd
 
 from benchmarks.adapters import autoselect_adapters, fitting_method_label, matched_adapters
 from benchmarks.datasets import Structure, all_series
-from benchmarks.evaluation import backtest, multi_ets_jit_overhead, valid_horizons
+from benchmarks.evaluation import backtest, valid_horizons
 from benchmarks.plotting import plot_relative_mse_boxplot, plot_series_forecast, plot_timing_bar
 
 RESULTS_DIR = Path(__file__).parent / "results"
-
-# One representative structure per multi_ets model class, for the JIT footnote.
-JIT_FOOTNOTE_STRUCTURES = {
-    "SES": Structure("none", "none"),
-    "Holt": Structure("add", "none"),
-    "DampedHolt": Structure("damped", "none"),
-    "HoltWinters": Structure("add", "add", 12),
-    "DampedHoltWinters": Structure("damped", "mul", 12),
-}
 
 
 def _structure_label(s: Structure) -> str:
@@ -107,14 +98,6 @@ def run() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_jit_footnote() -> pd.DataFrame:
-    rows = []
-    for name, structure in JIT_FOOTNOTE_STRUCTURES.items():
-        cold, warm = multi_ets_jit_overhead(structure, h=6)
-        rows.append({"multi_ets_class": name, "cold_fit_s": cold, "warm_median_fit_s": warm})
-    return pd.DataFrame(rows)
-
-
 def main() -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -130,11 +113,6 @@ def main() -> None:
 
     plot_relative_mse_boxplot(df, RESULTS_DIR)
     plot_timing_bar(df, RESULTS_DIR)
-
-    print("\n=== JIT cold-start footnote (multi_ets only; see CONTEXT.md/README) ===")
-    jit_df = run_jit_footnote()
-    jit_df.to_csv(RESULTS_DIR / "jit_overhead.csv", index=False)
-    print(jit_df.to_string(index=False))
 
     print("\n=== Matched-structure comparison: mean MSE by series/h/library ===")
     matched_summary = summary[summary["section"] == "matched"]
