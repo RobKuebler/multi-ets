@@ -96,6 +96,18 @@ def test_pinball_tau_orders_forecasts():
     assert np.all(high_tau.predict() >= low_tau.predict())
 
 
+def test_expectile_tau_orders_forecasts():
+    h = 3
+    rng = np.random.default_rng(3)
+    y = 5.0 + 1.5 * np.arange(40) + rng.normal(0, 1.5, 40)
+
+    mid_tau = Holt(h=h, loss="expectile", tau=0.5, n_starts=8).fit(y)
+    low_tau = Holt(h=h, loss="expectile", tau=0.1, n_starts=8).fit(y)
+    high_tau = Holt(h=h, loss="expectile", tau=0.9, n_starts=8).fit(y)
+    assert np.all(high_tau.predict() >= mid_tau.predict())
+    assert np.all(mid_tau.predict() >= low_tau.predict())
+
+
 def test_custom_callable_loss_is_used_to_fit():
     def weighted_mse(y_true, y_pred):
         return np.mean((y_pred - y_true) ** 2)
@@ -108,7 +120,13 @@ def test_custom_callable_loss_is_used_to_fit():
 
 @pytest.mark.parametrize(
     "loss_name,delta,tau",
-    [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
+    [
+        ("mse", 1.0, 0.5),
+        ("mae", 1.0, 0.5),
+        ("huber", 0.7, 0.5),
+        ("pinball", 1.0, 0.3),
+        ("expectile", 1.0, 0.3),
+    ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
 def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, delta, tau):
@@ -172,7 +190,13 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
 
 @pytest.mark.parametrize(
     "loss_name,delta,tau",
-    [("mse", 1.0, 0.5), ("mae", 1.0, 0.5), ("huber", 0.7, 0.5), ("pinball", 1.0, 0.3)],
+    [
+        ("mse", 1.0, 0.5),
+        ("mae", 1.0, 0.5),
+        ("huber", 0.7, 0.5),
+        ("pinball", 1.0, 0.3),
+        ("expectile", 1.0, 0.3),
+    ],
 )
 @pytest.mark.parametrize(
     "kind", ["seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult"]
@@ -237,6 +261,11 @@ def test_non_positive_huber_delta_raises():
 def test_out_of_range_pinball_tau_raises():
     with pytest.raises(ValueError, match="tau must be in"):
         Holt(h=3, loss="pinball", tau=1.5)
+
+
+def test_out_of_range_expectile_tau_raises():
+    with pytest.raises(ValueError, match="tau must be in"):
+        Holt(h=3, loss="expectile", tau=1.5)
 
 
 def test_damped_predict_returns_h_forecasts():
@@ -496,7 +525,14 @@ def test_attribute_set_after_construction_is_honored_at_fit():
 
 
 @pytest.mark.parametrize(
-    "loss,kwargs", [("mse", {}), ("mae", {}), ("huber", {"delta": 0.8}), ("pinball", {"tau": 0.4})]
+    "loss,kwargs",
+    [
+        ("mse", {}),
+        ("mae", {}),
+        ("huber", {"delta": 0.8}),
+        ("pinball", {"tau": 0.4}),
+        ("expectile", {"tau": 0.3}),
+    ],
 )
 def test_sample_weight_all_ones_matches_unweighted_fit(loss, kwargs):
     rng = np.random.default_rng(6)

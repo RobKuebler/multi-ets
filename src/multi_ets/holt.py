@@ -250,6 +250,9 @@ def _loss_value_np(
     if name == "pinball":
         e = y_true - y_pred
         return _masked_mean_np(np.maximum(tau * e, (tau - 1) * e), mask, weight)
+    if name == "expectile":
+        w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
+        return _masked_mean_np(w_asym * (y_true - y_pred) ** 2, mask, weight)
     raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- _loss_key already validated
 
 
@@ -274,6 +277,9 @@ def _loss_grad_np(
         g = np.clip(y_pred - y_true, -delta, delta)
     elif name == "pinball":
         g = np.where(y_true >= y_pred, -tau, 1.0 - tau)
+    elif name == "expectile":
+        w_asym = np.where(y_true >= y_pred, tau, 1.0 - tau)
+        g = 2.0 * w_asym * (y_pred - y_true)
     else:
         raise ValueError(f"Unknown loss {name!r}")  # pragma: no cover -- validated by _loss_key
     w = _full_weight(y_pred.shape, mask, weight)
