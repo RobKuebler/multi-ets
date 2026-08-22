@@ -1,14 +1,18 @@
 """Uniform (train, h) -> forecast adapters for multi_ets, statsmodels, statsforecast.
 
-Two families:
-  * matched_adapters(structure)   -- primary comparison, same trend/seasonal
+Three families:
+  * split_adapters(structure, n_starts) -- fit/predict as separate callables
+    (FitPredictAdapter), so callers can time each step independently.
+  * matched_adapters(structure) -- primary comparison, same trend/seasonal
     config forced on all three libraries (see CONTEXT.md's "Matched-structure
-    comparison").
+    comparison"); a thin fit+predict wrapper over split_adapters().
   * autoselect_adapters(seasonal_period) -- bonus comparison, each library
     picks its own structure via its native selection procedure.
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from statsforecast.models import AutoETS, SimpleExponentialSmoothingOptimized
@@ -19,6 +23,14 @@ from benchmarks.datasets import Structure
 from multi_ets import SES, DampedHolt, DampedHoltWinters, Holt, HoltWinters
 
 Adapter = Callable[[np.ndarray, int], np.ndarray]
+
+
+@dataclass
+class FitPredictAdapter:
+    """fit(train, h) -> fitted model; predict(fitted, h) -> forecast -- timed separately."""
+
+    fit: Callable[[np.ndarray, int], Any]
+    predict: Callable[[Any, int], np.ndarray]
 
 
 # multi_ets: multi-step joint loss, always. statsmodels: classical SSE,
@@ -37,14 +49,18 @@ def fitting_method_label(library: str, structure: Structure) -> str:
     raise ValueError(f"Unknown library {library!r}")
 
 
-def _multi_ets_model(structure: Structure, h: int):
+def _multi_ets_model(structure: Structure, h: int, n_starts: int = 10):
     if structure.seasonal == "none":
         cls = {"none": SES, "add": Holt, "damped": DampedHolt}[structure.trend]
-        return cls(h=h, loss="mse")
+        return cls(h=h, loss="mse", n_starts=n_starts)
     cls = DampedHoltWinters if structure.damped else HoltWinters
     seasonal_type = "additive" if structure.seasonal == "add" else "multiplicative"
     return cls(
-        h=h, seasonal_period=structure.seasonal_period, seasonal_type=seasonal_type, loss="mse"
+        h=h,
+        seasonal_period=structure.seasonal_period,
+        seasonal_type=seasonal_type,
+        loss="mse",
+        n_starts=n_starts,
     )
 
 
@@ -58,11 +74,16 @@ def _ets_model_string(structure: Structure) -> str:
     return f"{error_letter}{trend_letter}{season_letter}"
 
 
-def matched_adapters(structure: Structure) -> dict[str, Adapter]:
-    def multi_ets_fit_predict(train: np.ndarray, h: int) -> np.ndarray:
-        return _multi_ets_model(structure, h).fit(train).predict()
+def split_adapters(structure: Structure, n_starts: int = 10) -> dict[str, FitPredictAdapter]:
+    """Same matched-structure models as matched_adapters(), with fit/predict timed separately."""
 
-    def statsmodels_fit_predict(train: np.ndarray, h: int) -> np.ndarray:
+    def multi_ets_fit(train: np.ndarray, h: int) -> Any:
+        return _multi_ets_model(structure, h, n_starts=n_starts).fit(train)
+
+    def multi_ets_predict(fitted: Any, h: int) -> np.ndarray:
+        return np.asarray(fitted.predict())
+
+    def statsmodels_fit(train: np.ndarray, h: int) -> Any:
         kwargs: dict = {"initialization_method": "estimated"}
         if structure.trend != "none":
             kwargs["trend"] = "add"
@@ -70,10 +91,12 @@ def matched_adapters(structure: Structure) -> dict[str, Adapter]:
         if structure.seasonal != "none":
             kwargs["seasonal"] = structure.seasonal
             kwargs["seasonal_periods"] = structure.seasonal_period
-        fit = SMExponentialSmoothing(train, **kwargs).fit(optimized=True)
-        return np.asarray(fit.forecast(h))
+        return SMExponentialSmoothing(train, **kwargs).fit(optimized=True)
 
-    def statsforecast_fit_predict(train: np.ndarray, h: int) -> np.ndarray:
+    def statsmodels_predict(fitted: Any, h: int) -> np.ndarray:
+        return np.asarray(fitted.forecast(h))
+
+    def statsforecast_fit(train: np.ndarray, h: int) -> Any:
         if structure.trend == "none" and structure.seasonal == "none":
             model = SimpleExponentialSmoothingOptimized()
         else:
@@ -82,14 +105,47 @@ def matched_adapters(structure: Structure) -> dict[str, Adapter]:
                 model=_ets_model_string(structure),
                 damped=structure.damped,
             )
-        fitted = model.fit(np.asarray(train, dtype=float))
+        return model.fit(np.asarray(train, dtype=float))
+
+    def statsforecast_predict(fitted: Any, h: int) -> np.ndarray:
         return np.asarray(fitted.predict(h=h)["mean"])
 
     return {
-        "multi_ets": multi_ets_fit_predict,
-        "statsmodels": statsmodels_fit_predict,
-        "statsforecast": statsforecast_fit_predict,
+        "multi_ets": FitPredictAdapter(multi_ets_fit, multi_ets_predict),
+        "statsmodels": FitPredictAdapter(statsmodels_fit, statsmodels_predict),
+        "statsforecast": FitPredictAdapter(statsforecast_fit, statsforecast_predict),
     }
+
+
+def one_step_ahead_adapter(structure: Structure, n_starts: int = 10) -> FitPredictAdapter:
+    """multi_ets fit like classical exponential smoothing instead of its usual joint loss.
+
+    Fitting uses h=1, so the joint loss collapses to plain one-step-ahead SSE over every
+    origin (matching statsmodels' fitting philosophy). Forecasting past step 1 then relies
+    on the fitted recursion's own deterministic extrapolation: predict() computes its
+    multi-step forecast purely from self.h and the fitted params/states, with no other
+    h-dependent state cached by fit(), so retargeting self.h to the desired horizon before
+    calling predict() forecasts arbitrarily far ahead from a one-step fit.
+    """
+
+    def fit(train: np.ndarray, h: int) -> Any:
+        return _multi_ets_model(structure, h=1, n_starts=n_starts).fit(train)
+
+    def predict(fitted: Any, h: int) -> np.ndarray:
+        fitted.h = h
+        return np.asarray(fitted.predict())
+
+    return FitPredictAdapter(fit, predict)
+
+
+def matched_adapters(structure: Structure) -> dict[str, Adapter]:
+    def combined(adapter: FitPredictAdapter) -> Adapter:
+        def fit_predict(train: np.ndarray, h: int) -> np.ndarray:
+            return adapter.predict(adapter.fit(train, h), h)
+
+        return fit_predict
+
+    return {library: combined(adapter) for library, adapter in split_adapters(structure).items()}
 
 
 def _autoselect_candidate_structures(seasonal_period: int | None) -> list[Structure]:
