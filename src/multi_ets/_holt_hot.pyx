@@ -157,7 +157,9 @@ def objective_and_grad(
     double tau,
     double nb_alpha=1.0,
     double tw_p=1.5,
+    np.ndarray[np.float64_t, ndim=1] sample_weight=None,
 ):
+    cdef bint has_weight = sample_weight is not None
     cdef double alpha = params[0]
     cdef double beta = params[1]
     cdef double phi = params[2]
@@ -191,22 +193,23 @@ def objective_and_grad(
     # forward + loss dispatch: forecasts[t, k] = levels[t] + multiplier[k] * trends[t],
     # actuals[t, k] = y[t+k]. Mirrors _loss_value_np/_loss_grad_np's per-name formulas.
     cdef np.ndarray[np.float64_t, ndim=2] d_forecast = np.zeros((n_origins, h))
-    cdef double n = 0.0  # count of non-NaN-actual cells (#35), not just n_origins * h
+    cdef double weight_sum = 0.0  # sum of cell weights (#39), not just a count of cells
     cdef double loss = 0.0
-    cdef double forecast, true, g
+    cdef double forecast, true, g, w
     for t in range(n_origins):
         for k in range(h):
             true = y[t + k]
             if isnan(true):  # zero-weight this cell (#35): mirrors _nan_actual_mask
                 continue
+            w = sample_weight[t + k] if has_weight else 1.0
             forecast = levels[t] + multiplier[k] * trends[t]
-            loss += _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
-            d_forecast[t, k] = g
-            n += 1.0
-    loss /= n
+            loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
+            d_forecast[t, k] = w * g
+            weight_sum += w
+    loss /= weight_sum
     for t in range(n_origins):
         for k in range(h):
-            d_forecast[t, k] /= n
+            d_forecast[t, k] /= weight_sum
 
     # BPTT, mirroring _states_bptt_grad_np with phi as a genuine free parameter
     # (including the multiplier's own dependence on phi).
@@ -270,6 +273,7 @@ def seasonal_objective_and_grad(
     double tau,
     double nb_alpha=1.0,
     double tw_p=1.5,
+    np.ndarray[np.float64_t, ndim=1] sample_weight=None,
 ):
     """Mirrors _seasonal_states_np + _seasonal_states_bptt_grad_np +
     _seasonal_objective_and_grad.
@@ -278,6 +282,7 @@ def seasonal_objective_and_grad(
     returns (loss, grad) with grad in the same (6 + m)-element layout.
     multiplicative is a runtime flag (0/1), not a compile-time specialization.
     """
+    cdef bint has_weight = sample_weight is not None
     cdef double alpha = params[0]
     cdef double beta = params[1]
     cdef double phi = params[2]
@@ -332,9 +337,9 @@ def seasonal_objective_and_grad(
     cdef np.ndarray[np.float64_t, ndim=1] gl_direct = np.zeros(n_origins)
     cdef np.ndarray[np.float64_t, ndim=1] gt_direct = np.zeros(n_origins)
     cdef np.ndarray[np.float64_t, ndim=2] gb_direct = np.zeros((n_origins, m))
-    cdef double n = 0.0  # count of non-NaN-actual cells (#36), not just n_origins * h
+    cdef double weight_sum = 0.0  # sum of cell weights (#39), not just a count of cells
     cdef double loss = 0.0
-    cdef double forecast, true, g, trend_part_val, seasonal_part_val, mult_sum
+    cdef double forecast, true, g, w, trend_part_val, seasonal_part_val, mult_sum
     cdef double d_phi = 0.0
     for t in range(n_origins):
         mult_sum = 0.0
@@ -342,6 +347,7 @@ def seasonal_objective_and_grad(
             true = y[t + k]
             if isnan(true):  # zero-weight this cell (#36): mirrors _nan_actual_mask
                 continue
+            w = sample_weight[t + k] if has_weight else 1.0
             trend_part_val = levels[t] + multiplier[k] * trends[t]
             j = k % m
             seasonal_part_val = season_bufs[t, j]
@@ -349,8 +355,9 @@ def seasonal_objective_and_grad(
                 forecast = trend_part_val * seasonal_part_val
             else:
                 forecast = trend_part_val + seasonal_part_val
-            loss += _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
-            n += 1.0
+            loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
+            g *= w
+            weight_sum += w
 
             if multiplicative:
                 gl_direct[t] += g * seasonal_part_val
@@ -364,13 +371,13 @@ def seasonal_objective_and_grad(
                 mult_sum += g * d_multiplier_dphi[k]
         d_phi += trends[t] * mult_sum
 
-    loss /= n
+    loss /= weight_sum
     for t in range(n_origins):
-        gl_direct[t] /= n
-        gt_direct[t] /= n
+        gl_direct[t] /= weight_sum
+        gt_direct[t] /= weight_sum
         for j in range(m):
-            gb_direct[t, j] /= n
-    d_phi /= n
+            gb_direct[t, j] /= weight_sum
+    d_phi /= weight_sum
 
     # BPTT, mirroring _seasonal_states_bptt_grad_np: season0 is a free m-vector
     # too, and new_level feeds both new_trend and new_season each step, so the

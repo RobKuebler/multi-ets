@@ -13,7 +13,14 @@ from multi_ets import holt as holt_module
 _holt_hot = pytest.importorskip("multi_ets._holt_hot")
 
 _LOSS_ID = holt_module._LOSS_ID
-_KINDS = ("seasonal", "damped_seasonal", "seasonal_mult", "damped_seasonal_mult")
+_KINDS = (
+    "seasonal",
+    "damped_seasonal",
+    "seasonal_no_trend",
+    "seasonal_mult",
+    "damped_seasonal_mult",
+    "seasonal_no_trend_mult",
+)
 _LOSSES = (
     "mse",
     "mae",
@@ -43,6 +50,8 @@ def _random_params(kind: str, rng: np.random.Generator, multiplicative: bool) ->
     level0 = rng.uniform(15, 25) if multiplicative else rng.normal(0, 5)
     trend0 = rng.normal(0, 0.2) if multiplicative else rng.normal(0, 1)
     season0 = rng.uniform(0.7, 1.3, _M) if multiplicative else rng.normal(0, 1, _M)
+    if kind in ("seasonal_no_trend", "seasonal_no_trend_mult"):
+        return np.concatenate([[alpha, gamma, level0], season0])
     if kind in ("seasonal", "seasonal_mult"):
         return np.concatenate([[alpha, beta, gamma, level0, trend0], season0])
     phi = rng.uniform(0.05, 0.9)
@@ -85,10 +94,10 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
 
 
 @pytest.mark.parametrize("loss", _LOSSES)
-@pytest.mark.parametrize("trend", ["add", "damped"])
+@pytest.mark.parametrize("trend", ["add", "damped", None])
 @pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
 def test_fit_dispatches_to_compiled_backend(
-    trend: str, seasonal_type: str, loss: str, monkeypatch: pytest.MonkeyPatch
+    trend: str | None, seasonal_type: str, loss: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """fit() with a built-in loss must actually call the compiled seasonal_objective_and_grad.
 
@@ -176,10 +185,10 @@ def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
     np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
 
 
-@pytest.mark.parametrize("trend", ["add", "damped"])
+@pytest.mark.parametrize("trend", ["add", "damped", None])
 @pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
 def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
-    trend: str, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
+    trend: str | None, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#36: a NaN-containing y must still use the compiled backend, not fall back to NumPy."""
     rng = np.random.default_rng(0)
@@ -201,3 +210,78 @@ def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
         h=3, trend=trend, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss="mse"
     ).fit(y)
     assert calls, "fit() did not call the compiled backend for a NaN-containing y"
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_matches_numpy_reference_with_sample_weight(kind: str) -> None:
+    """#39: the compiled seasonal core's sample_weight handling must match the NumPy path."""
+    rng = np.random.default_rng(_SEED["mse", kind] + 300)
+    multiplicative = kind in holt_module._MULTIPLICATIVE_KINDS
+    y = rng.uniform(15, 25, 40) if multiplicative else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    h = 5
+    params = _random_params(kind, rng, multiplicative)
+    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _NB_ALPHA, _TW_P)
+
+    value_np, grad_np = holt_module._seasonal_objective_and_grad(
+        params, y, h, kind, _M, loss_key, sample_weight=sample_weight
+    )
+
+    alpha, beta, phi, gamma, level0, trend0, season0 = holt_module._UNPACK_SEASONAL_BY_KIND[kind](
+        params, _M
+    )
+    full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
+    value_c, grad_c_full = _holt_hot.seasonal_objective_and_grad(
+        full,
+        y,
+        h,
+        _M,
+        int(multiplicative),
+        _LOSS_ID["mse"],
+        _DELTA,
+        _TAU,
+        _NB_ALPHA,
+        _TW_P,
+        sample_weight,
+    )
+    grad_c = holt_module._PACK_GRAD_SEASONAL_BY_KIND[kind](
+        (
+            grad_c_full[0],
+            grad_c_full[1],
+            grad_c_full[2],
+            grad_c_full[3],
+            grad_c_full[4],
+            grad_c_full[5],
+            grad_c_full[6:],
+        )
+    )
+
+    assert value_c == pytest.approx(value_np, abs=1e-9)
+    np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
+
+
+@pytest.mark.parametrize("trend", ["add", "damped", None])
+@pytest.mark.parametrize("seasonal_type", ["additive", "multiplicative"])
+def test_weighted_fit_dispatches_to_compiled_backend(
+    trend: str | None, seasonal_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#39: a weighted fit with a built-in loss must use the compiled backend, not fall back."""
+    rng = np.random.default_rng(0)
+    y = (
+        rng.uniform(15, 25, 40)
+        if seasonal_type == "multiplicative"
+        else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    )
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    calls = []
+    real = _holt_hot.seasonal_objective_and_grad
+
+    def spy(*args: object, **kwargs: object) -> tuple[float, np.ndarray]:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_holt_hot, "seasonal_objective_and_grad", spy)
+    ExponentialSmoothing(
+        h=3, trend=trend, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss="mse"
+    ).fit(y, sample_weight=sample_weight)
+    assert calls, "a weighted fit did not call the compiled backend"

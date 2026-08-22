@@ -997,7 +997,7 @@ class ExponentialSmoothing:
                 else:
                     *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
                 return float(loss_key(actuals, forecasts))
-            if _holt_hot is not None and weight is None and loss_key[0] in _LOSS_ID:
+            if _holt_hot is not None and loss_key[0] in _LOSS_ID:
                 name, delta, tau, nb_alpha, tw_p = loss_key
                 if seasonal:
                     alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
@@ -1015,6 +1015,7 @@ class ExponentialSmoothing:
                         tau,
                         nb_alpha,
                         tw_p,
+                        weight,
                     )
                     grad_tuple = (
                         grad_full[0],
@@ -1028,13 +1029,10 @@ class ExponentialSmoothing:
                     return value, _PACK_GRAD_SEASONAL_BY_KIND[self._kind](grad_tuple)
                 full5 = np.asarray(_UNPACK_BY_KIND[self._kind](p), dtype=float)
                 value, grad5 = _holt_hot.objective_and_grad(
-                    full5, y, self.h, _LOSS_ID[name], delta, tau, nb_alpha, tw_p
+                    full5, y, self.h, _LOSS_ID[name], delta, tau, nb_alpha, tw_p, weight
                 )
                 return value, _PACK_GRAD_BY_KIND[self._kind](grad5)
-            # ponytail: the compiled _holt_hot core doesn't take sample_weight
-            # yet, so weighted fits always use the NumPy path; teach it to
-            # _holt_hot.objective_and_grad/seasonal_objective_and_grad if
-            # weighted fits need the speedup.
+            # Extension not built (optional `[fast]` extra, see docs/adr/0002): NumPy fallback.
             if seasonal:
                 return _seasonal_objective_and_grad(
                     p, y, self.h, self._kind, m, loss_key, n_valid, weight

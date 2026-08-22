@@ -150,3 +150,49 @@ def test_fit_dispatches_to_compiled_backend_for_nan_containing_y(
     monkeypatch.setattr(_holt_hot, "objective_and_grad", spy)
     ExponentialSmoothing(h=3, trend=trend, n_starts=2, loss="mse").fit(y)
     assert calls, "fit() did not call the compiled backend for a NaN-containing y"
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_matches_numpy_reference_with_sample_weight(kind: str) -> None:
+    """#39: the compiled core's sample_weight handling must match the NumPy path."""
+    rng = np.random.default_rng(_SEED["mse", kind] + 200)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    h = 5
+    params = _random_params(kind, rng)
+    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _NB_ALPHA, _TW_P)
+
+    value_np, grad_np = holt_module._holt_objective_and_grad(
+        params, y, h, kind, loss_key, sample_weight=sample_weight
+    )
+
+    full5 = np.asarray(holt_module._UNPACK_BY_KIND[kind](params), dtype=float)
+    value_c, grad5_c = _holt_hot.objective_and_grad(
+        full5, y, h, _LOSS_ID["mse"], _DELTA, _TAU, _NB_ALPHA, _TW_P, sample_weight
+    )
+    grad_c = holt_module._PACK_GRAD_BY_KIND[kind](grad5_c)
+
+    assert value_c == pytest.approx(value_np, abs=1e-9)
+    np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
+
+
+@pytest.mark.parametrize("trend", ["add", None, "damped"])
+def test_weighted_fit_dispatches_to_compiled_backend(
+    trend: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#39: a weighted fit with a built-in loss must use the compiled backend, not fall back."""
+    rng = np.random.default_rng(0)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    calls = []
+    real = _holt_hot.objective_and_grad
+
+    def spy(*args: object, **kwargs: object) -> tuple[float, np.ndarray]:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_holt_hot, "objective_and_grad", spy)
+    ExponentialSmoothing(h=3, trend=trend, n_starts=2, loss="mse").fit(
+        y, sample_weight=sample_weight
+    )
+    assert calls, "a weighted fit did not call the compiled backend"
