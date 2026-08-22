@@ -48,7 +48,7 @@ convention = "numpy"
 "tests/*" = ["D", "ANN"]
 "examples/*" = ["D", "ANN"]
 "benchmarks/*" = ["D", "ANN"]
-"spikes/*" = ["D", "ANN"]
+"spikes/**" = ["D", "ANN"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
