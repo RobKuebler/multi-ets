@@ -5,3 +5,8 @@ __pycache__/
 .ruff_cache/
 .coverage
 benchmarks/results/
+
+# Regenerable Cython build artifacts (issue #22) -- see src/multi_ets/setup.py.
+src/multi_ets/build/
+src/multi_ets/_holt_hot.c
+src/multi_ets/_holt_hot*.so
