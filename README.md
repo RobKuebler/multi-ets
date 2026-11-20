@@ -72,6 +72,10 @@ forecasts = (
     .fit(y)
     .predict()
 )
+
+# Only some horizon steps matter, e.g. days 1-3 and 7-9: trains on horizon 9, but only the
+# listed steps count in the loss; predict() returns those 6 values.
+forecasts = ExponentialSmoothing(h=[1, 2, 3, 7, 8, 9], trend="add").fit(y).predict()
 ```
 
 `trend` is `None` (default, no trend), `"add"`, or `"damped"`; `seasonal_period` (default `None`)
@@ -130,7 +134,7 @@ it directly.
 ### Loss
 
 All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+
-`tau`), `"expectile"` (+ `tau`), `"logcosh"`, `"poisson"`, `"negbinom"` (+ `alpha` dispersion), or
+`tau`), `"expectile"` (+ `tau`), `"logcosh"`, `"poisson"`, `"negbinom"` (+ `dispersion`), or
 `"tweedie"` (+ `p` power, `1 < p < 2`), or any callable `(y_true, y_pred) -> scalar` written in
 plain NumPy. `poisson`/`negbinom`/`tweedie` require a non-negative `y`.
 

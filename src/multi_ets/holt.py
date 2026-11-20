@@ -2,7 +2,7 @@
 
 import itertools
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Self
 
 import numpy as np
@@ -27,10 +27,13 @@ def _loss_key(
     loss: str | Callable[..., Any],
     delta: float,
     tau: float,
-    alpha: float = 1.0,
+    dispersion: float = 1.0,
     p: float = 1.5,
 ) -> Any:
-    """Hashable identity for a loss choice; a resolved built-in is (name, delta, tau, alpha, p)."""
+    """Hashable identity for a loss choice.
+
+    A resolved built-in is (name, delta, tau, dispersion, p).
+    """
     if callable(loss):
         return loss
     if loss not in (
@@ -52,11 +55,38 @@ def _loss_key(
         raise ValueError(f"huber delta must be positive, got {delta}")
     if loss in ("pinball", "expectile") and not 0 < tau < 1:
         raise ValueError(f"{loss} tau must be in (0, 1), got {tau}")
-    if loss == "negbinom" and alpha <= 0:
-        raise ValueError(f"negbinom alpha (dispersion) must be positive, got {alpha}")
+    if loss == "negbinom" and dispersion <= 0:
+        raise ValueError(f"negbinom dispersion must be positive, got {dispersion}")
     if loss == "tweedie" and not 1 < p < 2:
         raise ValueError(f"tweedie p must be in (1, 2), got {p}")
-    return (loss, delta, tau, alpha, p)
+    return (loss, delta, tau, dispersion, p)
+
+
+def _resolve_steps(h: int | Sequence[int]) -> tuple[int, np.ndarray, np.ndarray | None]:
+    """(H, idx, step_weight) for an int h (steps 1..h) or a sequence of horizon steps.
+
+    H = max step is the training/forecast horizon; idx are the 0-based columns
+    of the requested steps; step_weight is a (H,) 0/1 per-horizon-step weight
+    zeroing the unrequested steps in the joint loss, or None when every step
+    1..H is requested (keeps int-h fits on the unweighted fast path).
+    """
+    if isinstance(h, (int, np.integer)) and not isinstance(h, bool):
+        return int(h), np.arange(h), None
+    steps = sorted(np.asarray(h).tolist())
+    if (
+        not steps
+        or len(set(steps)) != len(steps)
+        or not all(isinstance(s, int) and not isinstance(s, bool) for s in steps)
+        or steps[0] < 1
+    ):
+        raise ValueError(f"h must be an int or a non-empty list of distinct positive ints, got {h}")
+    horizon = int(steps[-1])
+    idx = np.asarray(steps, dtype=int) - 1
+    if len(idx) == horizon:  # contiguous 1..H: same as int h
+        return horizon, idx, None
+    step_weight = np.zeros(horizon)
+    step_weight[idx] = 1.0
+    return horizon, idx, step_weight
 
 
 # loss_id convention shared with _holt_hot.pyx: 0=mse, 1=mae, 2=huber, 3=pinball,
@@ -347,7 +377,7 @@ def _loss_value_np(
     becomes this per-(origin, horizon-step) shape. actual_mask (#33): see
     _full_weight.
     """
-    name, delta, tau = loss_key[:3]  # alpha/p: read by the one branch that needs them
+    name, delta, tau = loss_key[:3]  # dispersion/p: read by the one branch that needs them
     if name == "mse":
         return _masked_mean_np((y_pred - y_true) ** 2, mask, weight, actual_mask)
     if name == "mae":
@@ -366,11 +396,12 @@ def _loss_value_np(
         dev = 2.0 * (xlogy(y_true, y_true / mu) - (y_true - mu))
         return _masked_mean_np(dev, mask, weight, actual_mask)
     if name == "negbinom":
-        alpha = loss_key[3]
+        dispersion = loss_key[3]
         mu = np.maximum(y_pred, _BOUND_EPS)
         dev = 2.0 * (
             xlogy(y_true, y_true / mu)
-            - (y_true + 1.0 / alpha) * np.log((1.0 + alpha * y_true) / (1.0 + alpha * mu))
+            - (y_true + 1.0 / dispersion)
+            * np.log((1.0 + dispersion * y_true) / (1.0 + dispersion * mu))
         )
         return _masked_mean_np(dev, mask, weight, actual_mask)
     if name == "tweedie":
@@ -405,7 +436,7 @@ def _loss_grad_np(
     The one piece that changes between loss types; shared by the non-seasonal
     (here) and seasonal (#19) BPTT passes. weight/actual_mask: see _loss_value_np.
     """
-    name, delta, tau = loss_key[:3]  # alpha/p: read by the one branch that needs them
+    name, delta, tau = loss_key[:3]  # dispersion/p: read by the one branch that needs them
     if name == "mse":
         g = 2.0 * (y_pred - y_true)
     elif name == "mae":
@@ -418,9 +449,9 @@ def _loss_grad_np(
         mu = np.maximum(y_pred, _BOUND_EPS)
         g = np.where(y_pred > _BOUND_EPS, 2.0 * (1.0 - y_true / mu), 0.0)
     elif name == "negbinom":
-        alpha = loss_key[3]
+        dispersion = loss_key[3]
         mu = np.maximum(y_pred, _BOUND_EPS)
-        g = np.where(y_pred > _BOUND_EPS, 2.0 * (mu - y_true) / (mu * (1.0 + alpha * mu)), 0.0)
+        g = np.where(y_pred > _BOUND_EPS, 2.0 * (mu - y_true) / (mu * (1.0 + dispersion * mu)), 0.0)
     elif name == "tweedie":
         p = loss_key[4]
         mu = np.maximum(y_pred, _BOUND_EPS)
@@ -567,6 +598,7 @@ def _holt_objective_and_grad(
     loss_key: tuple[str, float, float, float, float],
     n_valid: int | None = None,
     sample_weight: np.ndarray | None = None,
+    step_weight: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """(loss, grad) for the plain (non-seasonal) Holt recursion, hand-derived (#18).
 
@@ -577,7 +609,8 @@ def _holt_objective_and_grad(
     weight per element of y; each loss term is weighted by the sample_weight
     of the specific y observation it scores (see _weight_matrix_np), so an
     observation is weighted consistently across every origin window it falls
-    into, not just the one where it's the origin.
+    into, not just the one where it's the origin. step_weight, if given, is
+    one weight per horizon step (see _resolve_steps).
     """
     alpha, beta, phi, levels, trends, multiplier, forecasts, actuals = _holt_forward_np(
         params, y, h, kind
@@ -585,6 +618,8 @@ def _holt_objective_and_grad(
     n_origins = forecasts.shape[0]
     mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
     weight = _weight_matrix_np(sample_weight, n_origins, h) if sample_weight is not None else None
+    if step_weight is not None:  # per-horizon-step weight (list h): broadcasts over origins
+        weight = step_weight if weight is None else weight * step_weight
     actual_mask = _nan_actual_mask(actuals)
     value = _loss_value_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
     d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
@@ -838,6 +873,7 @@ def _seasonal_objective_and_grad(
     loss_key: tuple[str, float, float, float, float],
     n_valid: int | None = None,
     sample_weight: np.ndarray | None = None,
+    step_weight: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """(loss, grad) for the seasonal Holt-Winters recursion, hand-derived (#19).
 
@@ -845,7 +881,7 @@ def _seasonal_objective_and_grad(
     Mirrors _holt_objective_and_grad's non-seasonal shape; loss_key must be a
     resolved built-in key (see _loss_key) -- callers fall back to scipy's own
     finite-difference jac for custom callables, since those aren't
-    differentiated here. sample_weight: see _holt_objective_and_grad.
+    differentiated here. sample_weight/step_weight: see _holt_objective_and_grad.
     """
     multiplicative = kind in _MULTIPLICATIVE_KINDS
     (
@@ -865,6 +901,8 @@ def _seasonal_objective_and_grad(
     n_origins = forecasts.shape[0]
     mask = _origin_mask_np(n_origins, n_valid, h) if n_valid is not None else None
     weight = _weight_matrix_np(sample_weight, n_origins, h) if sample_weight is not None else None
+    if step_weight is not None:  # per-horizon-step weight (list h): broadcasts over origins
+        weight = step_weight if weight is None else weight * step_weight
     actual_mask = _nan_actual_mask(actuals)
     value = _loss_value_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
     d_forecast = _loss_grad_np(loss_key, actuals, forecasts, mask, weight, actual_mask)
@@ -944,12 +982,14 @@ class ExponentialSmoothing:
     trend; seasonal_period adds an additive or multiplicative (seasonal_type)
     seasonal component on top of either trend. Parameters are fit jointly by
     minimizing the average forecast error across every valid origin and every
-    horizon step 1..h.
+    horizon step 1..h. h may instead be a list of horizon steps, e.g.
+    [1, 2, 3, 7, 8, 9]: the model then trains on horizon max(h) but only the
+    listed steps count in the loss, and predict() returns just those steps.
     """
 
     def __init__(
         self,
-        h: int,
+        h: int | Sequence[int],
         trend: str | None = None,
         seasonal_period: int | None = None,
         seasonal_type: str = "additive",
@@ -957,10 +997,11 @@ class ExponentialSmoothing:
         n_starts: int = 10,
         delta: float = 1.0,
         tau: float = 0.5,
-        alpha: float = 1.0,
+        dispersion: float = 1.0,
         p: float = 1.5,
     ) -> None:
-        _loss_key(loss, delta, tau, alpha, p)  # validate eagerly, re-resolved fresh in fit()
+        _loss_key(loss, delta, tau, dispersion, p)  # validate eagerly, re-resolved fresh in fit()
+        _resolve_steps(h)  # validate eagerly; re-resolved from self.h wherever it's used
         self._kind = _resolve_kind(trend, seasonal_period, seasonal_type)
         self.h = h
         self.trend = trend
@@ -970,7 +1011,7 @@ class ExponentialSmoothing:
         self.n_starts = n_starts
         self.delta = delta
         self.tau = tau
-        self.alpha = alpha
+        self.dispersion = dispersion
         self.p = p
         self.params_: np.ndarray | None = None
 
@@ -985,9 +1026,10 @@ class ExponentialSmoothing:
         y = np.asarray(y, dtype=float)
         seasonal = self._kind in _SEASONAL_KINDS
         m = self.seasonal_period or 0  # 0: dummy, only ever read when seasonal is True
-        if len(y) < self.h + 1:
+        h, idx, step_weight = _resolve_steps(self.h)
+        if len(y) < h + 1:
             raise ValueError(
-                f"Series too short: need at least h + 1 = {self.h + 1} points, got {len(y)}"
+                f"Series too short: need at least h + 1 = {h + 1} points, got {len(y)}"
             )
         if seasonal and len(y) < 2 * m:
             raise ValueError(
@@ -996,7 +1038,7 @@ class ExponentialSmoothing:
             )
         _warn_and_validate_nan(y)
 
-        loss_key = _loss_key(self.loss, self.delta, self.tau, self.alpha, self.p)
+        loss_key = _loss_key(self.loss, self.delta, self.tau, self.dispersion, self.p)
         custom = callable(loss_key)
         if not custom:
             _validate_nonnegative_y(loss_key[0], y)
@@ -1010,12 +1052,12 @@ class ExponentialSmoothing:
                 # jac=False below falls back to its own finite-difference
                 # estimate. This whole fit path is plain NumPy -- no jax.
                 if seasonal:
-                    forecasts, actuals = _seasonal_forward_np(p, y, self.h, self._kind, m)[-2:]
+                    forecasts, actuals = _seasonal_forward_np(p, y, h, self._kind, m)[-2:]
                 else:
-                    *_, forecasts, actuals = _holt_forward_np(p, y, self.h, self._kind)
-                return float(loss_key(actuals, forecasts))
+                    *_, forecasts, actuals = _holt_forward_np(p, y, h, self._kind)
+                return float(loss_key(actuals[:, idx], forecasts[:, idx]))
             if _holt_hot is not None and loss_key[0] in _LOSS_ID:
-                name, delta, tau, nb_alpha, tw_p = loss_key
+                name, delta, tau, dispersion, tw_p = loss_key
                 if seasonal:
                     alpha, beta, phi, gamma, level0, trend0, season0 = _UNPACK_SEASONAL_BY_KIND[
                         self._kind
@@ -1024,15 +1066,16 @@ class ExponentialSmoothing:
                     value, grad_full = _holt_hot.seasonal_objective_and_grad(
                         full,
                         y,
-                        self.h,
+                        h,
                         m,
                         int(multiplicative),
                         _LOSS_ID[name],
                         delta,
                         tau,
-                        nb_alpha,
+                        dispersion,
                         tw_p,
                         weight,
+                        step_weight,
                     )
                     grad_tuple = (
                         grad_full[0],
@@ -1046,15 +1089,17 @@ class ExponentialSmoothing:
                     return value, _PACK_GRAD_SEASONAL_BY_KIND[self._kind](grad_tuple)
                 full5 = np.asarray(_UNPACK_BY_KIND[self._kind](p), dtype=float)
                 value, grad5 = _holt_hot.objective_and_grad(
-                    full5, y, self.h, _LOSS_ID[name], delta, tau, nb_alpha, tw_p, weight
+                    full5, y, h, _LOSS_ID[name], delta, tau, dispersion, tw_p, weight, step_weight
                 )
                 return value, _PACK_GRAD_BY_KIND[self._kind](grad5)
             # Extension not built (optional `[fast]` extra, see docs/adr/0002): NumPy fallback.
             if seasonal:
                 return _seasonal_objective_and_grad(
-                    p, y, self.h, self._kind, m, loss_key, n_valid, weight
+                    p, y, h, self._kind, m, loss_key, n_valid, weight, step_weight
                 )
-            return _holt_objective_and_grad(p, y, self.h, self._kind, loss_key, n_valid, weight)
+            return _holt_objective_and_grad(
+                p, y, h, self._kind, loss_key, n_valid, weight, step_weight
+            )
 
         n_trend = _N_TREND_PARAMS[self._kind]
         n_free = _N_FREE_PARAMS[self._kind]
@@ -1097,9 +1142,15 @@ class ExponentialSmoothing:
         return self
 
     def predict(self) -> np.ndarray:
-        """Forecast the next self.h steps from the fitted state."""
+        """Forecast the requested horizon steps (1..h, or the listed ones) from the fitted state."""
         if self.params_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
+        h, idx, _ = _resolve_steps(self.h)
+        return self._forecast(h)[idx]
+
+    def _forecast(self, h: int) -> np.ndarray:
+        """Forecast every step 1..h from the fitted state."""
+        assert self.params_ is not None  # only called from predict(), already checked
         if self._kind in _SEASONAL_KINDS:
             m = self.seasonal_period or 0  # 0: dummy, unreachable since we're in a seasonal kind
             multiplicative = self._kind in _MULTIPLICATIVE_KINDS
@@ -1110,8 +1161,8 @@ class ExponentialSmoothing:
                 alpha, beta, phi, gamma, level0, trend0, season0, self._y, m, multiplicative
             )
             level, trend = float(levels[-1]), float(trends[-1])
-            multiplier = _forecast_multiplier_np(phi, self.h)
-            seasonal_vals = np.asarray(season_bufs[-1])[np.arange(self.h) % m]
+            multiplier = _forecast_multiplier_np(phi, h)
+            seasonal_vals = np.asarray(season_bufs[-1])[np.arange(h) % m]
             trend_part = level + multiplier * trend
             return trend_part * seasonal_vals if multiplicative else trend_part + seasonal_vals
         # Unified formula: for "ses", beta/phi/trend0 are all pinned to 0, so
@@ -1119,7 +1170,7 @@ class ExponentialSmoothing:
         alpha, beta, phi, level0, trend0 = _UNPACK_BY_KIND[self._kind](self.params_)
         levels, trends = _states_np(alpha, beta, phi, level0, trend0, self._y)
         level, trend = float(levels[-1]), float(trends[-1])
-        multiplier = _forecast_multiplier_np(phi, self.h)
+        multiplier = _forecast_multiplier_np(phi, h)
         return level + multiplier * trend
 
     def _rescale_seasonal(self) -> None:
@@ -1157,7 +1208,7 @@ class ExponentialSmoothing:
             self.params_[n + nf : n + nf + m] -= c
 
     def _resid_std(self) -> np.ndarray:
-        """Per-horizon-step std of (actual - forecast) across every valid training origin.
+        """Per-requested-horizon-step std of (actual - forecast) across every valid training origin.
 
         Recomputes the forecast matrix from the fitted params, dispatching
         seasonal vs. non-seasonal by _kind exactly like the fit objective
@@ -1171,16 +1222,15 @@ class ExponentialSmoothing:
         horizon step gives that step a NaN std (and so a NaN interval).
         """
         assert self.params_ is not None  # called only from predict_interval(), already checked
+        h, idx, _ = _resolve_steps(self.h)
         if self._kind in _SEASONAL_KINDS:
             m = self.seasonal_period or 0  # 0: dummy, unreachable since we're in a seasonal kind
-            *_, forecasts, actuals = _seasonal_forward_np(
-                self.params_, self._y, self.h, self._kind, m
-            )
+            *_, forecasts, actuals = _seasonal_forward_np(self.params_, self._y, h, self._kind, m)
         else:
-            *_, forecasts, actuals = _holt_forward_np(self.params_, self._y, self.h, self._kind)
+            *_, forecasts, actuals = _holt_forward_np(self.params_, self._y, h, self._kind)
         # nanstd (#33): a NaN actual contributes no residual, matching the
         # same cells the fit's own joint loss zero-weights (_nan_actual_mask).
-        return np.nanstd(actuals - forecasts, axis=0)
+        return np.nanstd(actuals - forecasts, axis=0)[idx]
 
     def predict_interval(
         self, coverage: float | list[float] | tuple[float, ...] = 0.9

@@ -1,11 +1,17 @@
 """Model selection via rolling-origin cross-validation."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Self
 
 import numpy as np
 
-from multi_ets.holt import ExponentialSmoothing, _loss_key, _loss_value_np, _nan_actual_mask
+from multi_ets.holt import (
+    ExponentialSmoothing,
+    _loss_key,
+    _loss_value_np,
+    _nan_actual_mask,
+    _resolve_steps,
+)
 
 
 def select_model(
@@ -14,8 +20,9 @@ def select_model(
     """Pick the best of `candidates` by rolling-origin CV, each scored with its own loss/h.
 
     Split scheme: rolling-origin, expanding-window, non-overlapping, step =
-    candidate's own h. Split i (earliest first) trains on
-    y[:len(y) - (n_splits - i) * h] and scores against the next h points.
+    candidate's own h (max(h) for a list h). Split i (earliest first) trains on
+    y[:len(y) - (n_splits - i) * h] and scores against the next h points (only
+    the listed steps, for a list h).
 
     Returns (best, scores): best is refit on the full series, scores is
     {candidate: mean_cv_loss} for every candidate.
@@ -24,9 +31,9 @@ def select_model(
     scores: dict[ExponentialSmoothing, float] = {}
     for candidate in candidates:
         loss_key = _loss_key(
-            candidate.loss, candidate.delta, candidate.tau, candidate.alpha, candidate.p
+            candidate.loss, candidate.delta, candidate.tau, candidate.dispersion, candidate.p
         )
-        h = candidate.h
+        h, idx, _ = _resolve_steps(candidate.h)
         if len(y) < n_splits * h:
             raise ValueError(
                 f"Series too short for n_splits={n_splits} with h={h}: "
@@ -35,7 +42,7 @@ def select_model(
         losses = []
         for split in range(n_splits):
             cutoff = len(y) - (n_splits - split) * h
-            train, test = y[:cutoff], y[cutoff : cutoff + h]
+            train, test = y[:cutoff], y[cutoff : cutoff + h][idx]
             candidate.fit(train)
             pred = candidate.predict()
             loss = (
@@ -70,14 +77,14 @@ class AutoExponentialSmoothing:
 
     def __init__(
         self,
-        h: int,
+        h: int | Sequence[int],
         seasonal_period: int | None = None,
         loss: str | Callable[..., Any] = "mse",
         n_starts: int = 10,
         n_splits: int = 3,
         delta: float = 1.0,
         tau: float = 0.5,
-        alpha: float = 1.0,
+        dispersion: float = 1.0,
         p: float = 1.5,
     ) -> None:
         self.h = h
@@ -87,7 +94,7 @@ class AutoExponentialSmoothing:
         self.n_splits = n_splits
         self.delta = delta
         self.tau = tau
-        self.alpha = alpha
+        self.dispersion = dispersion
         self.p = p
         self.best_: ExponentialSmoothing | None = None
         self.scores_: dict[ExponentialSmoothing, float] | None = None
@@ -102,7 +109,7 @@ class AutoExponentialSmoothing:
             n_starts=self.n_starts,
             delta=self.delta,
             tau=self.tau,
-            alpha=self.alpha,
+            dispersion=self.dispersion,
             p=self.p,
         )
 

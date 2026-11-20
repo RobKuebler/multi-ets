@@ -28,8 +28,12 @@ Shared conventions between the two cores:
   _loss_value_np/_loss_grad_np's per-name branches:
       0 = mse, 1 = mae, 2 = huber, 3 = pinball,
       4 = poisson, 5 = negbinom, 6 = tweedie, 7 = expectile, 8 = logcosh
-  delta/tau are only read by huber/pinball/expectile; nb_alpha/tw_p are only
-  read by negbinom/tweedie respectively (#32). Both cores dispatch through
+  delta/tau are only read by huber/pinball/expectile; dispersion/tw_p are only
+  read by negbinom/tweedie respectively (#32).
+
+step_weight (optional, length h): per-horizon-step weight for a list h (see
+holt.py's _resolve_steps); a zero-weight step is skipped exactly like a NaN
+actual, so it contributes neither loss nor gradient. Both cores dispatch through
   the same _loss_and_grad helper below.
 
 Custom callable losses are out of scope here (they stay on the NumPy path,
@@ -72,7 +76,7 @@ cdef inline double _xlogy(double x, double y):
 
 cdef inline double _loss_and_grad(
     double forecast, double true, int loss_id, double delta, double tau,
-    double nb_alpha, double tw_p, double *g
+    double dispersion, double tw_p, double *g
 ):
     """loss(forecast, true) and d(loss)/d(forecast), for one (t, k) pair.
 
@@ -105,9 +109,9 @@ cdef inline double _loss_and_grad(
         mu = fmax(forecast, _BOUND_EPS)
         loss = 2.0 * (
             _xlogy(true, true / mu)
-            - (true + 1.0 / nb_alpha) * log((1.0 + nb_alpha * true) / (1.0 + nb_alpha * mu))
+            - (true + 1.0 / dispersion) * log((1.0 + dispersion * true) / (1.0 + dispersion * mu))
         )
-        g[0] = 2.0 * (mu - true) / (mu * (1.0 + nb_alpha * mu)) if forecast > _BOUND_EPS else 0.0
+        g[0] = 2.0 * (mu - true) / (mu * (1.0 + dispersion * mu)) if forecast > _BOUND_EPS else 0.0
     elif loss_id == 6:  # tweedie deviance
         mu = fmax(forecast, _BOUND_EPS)
         loss = 2.0 * (
@@ -155,11 +159,13 @@ def objective_and_grad(
     int loss_id,
     double delta,
     double tau,
-    double nb_alpha=1.0,
+    double dispersion=1.0,
     double tw_p=1.5,
     np.ndarray[np.float64_t, ndim=1] sample_weight=None,
+    np.ndarray[np.float64_t, ndim=1] step_weight=None,
 ):
     cdef bint has_weight = sample_weight is not None
+    cdef bint has_step = step_weight is not None
     cdef double alpha = params[0]
     cdef double beta = params[1]
     cdef double phi = params[2]
@@ -201,9 +207,13 @@ def objective_and_grad(
             true = y[t + k]
             if isnan(true):  # zero-weight this cell (#35): mirrors _nan_actual_mask
                 continue
+            # ponytail: 0/1 mask only (all _resolve_steps emits), multiply w by
+            # step_weight[k] if fractional per-step weights are ever needed.
+            if has_step and step_weight[k] == 0:  # unrequested horizon step (list h)
+                continue
             w = sample_weight[t + k] if has_weight else 1.0
             forecast = levels[t] + multiplier[k] * trends[t]
-            loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
+            loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, dispersion, tw_p, &g)
             d_forecast[t, k] = w * g
             weight_sum += w
     if weight_sum <= 0:  # #25/#35/#39: sample_weight/NaN combo zeroed every valid cell
@@ -277,9 +287,10 @@ def seasonal_objective_and_grad(
     int loss_id,
     double delta,
     double tau,
-    double nb_alpha=1.0,
+    double dispersion=1.0,
     double tw_p=1.5,
     np.ndarray[np.float64_t, ndim=1] sample_weight=None,
+    np.ndarray[np.float64_t, ndim=1] step_weight=None,
 ):
     """Mirrors _seasonal_states_np + _seasonal_states_bptt_grad_np +
     _seasonal_objective_and_grad.
@@ -289,6 +300,7 @@ def seasonal_objective_and_grad(
     multiplicative is a runtime flag (0/1), not a compile-time specialization.
     """
     cdef bint has_weight = sample_weight is not None
+    cdef bint has_step = step_weight is not None
     cdef double alpha = params[0]
     cdef double beta = params[1]
     cdef double phi = params[2]
@@ -353,6 +365,10 @@ def seasonal_objective_and_grad(
             true = y[t + k]
             if isnan(true):  # zero-weight this cell (#36): mirrors _nan_actual_mask
                 continue
+            # ponytail: 0/1 mask only (all _resolve_steps emits), multiply w by
+            # step_weight[k] if fractional per-step weights are ever needed.
+            if has_step and step_weight[k] == 0:  # unrequested horizon step (list h)
+                continue
             w = sample_weight[t + k] if has_weight else 1.0
             trend_part_val = levels[t] + multiplier[k] * trends[t]
             j = k % m
@@ -361,7 +377,7 @@ def seasonal_objective_and_grad(
                 forecast = trend_part_val * seasonal_part_val
             else:
                 forecast = trend_part_val + seasonal_part_val
-            loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, nb_alpha, tw_p, &g)
+            loss += w * _loss_and_grad(forecast, true, loss_id, delta, tau, dispersion, tw_p, &g)
             g *= w
             weight_sum += w
 
