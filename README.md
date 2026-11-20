@@ -190,3 +190,7 @@ uv run ruff check .    # lint
 uv run ruff format .   # format
 uv run ty check src    # type check
 ```
+
+## License
+
+[MIT No Attribution](LICENSE) (MIT-0): use, modify and redistribute it for any purpose, commercial included, with no attribution required.

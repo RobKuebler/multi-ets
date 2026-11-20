@@ -1,16 +1,37 @@
 [project]
 name = "multi-ets"
 version = "0.1.0"
-description = "Add your description here"
+description = "Exponential smoothing (SES, Holt, Holt-Winters) fit by joint multi-step-ahead loss instead of one-step-ahead residuals."
 readme = "README.md"
 authors = [
-    { name = "Garve", email = "xgarve@gmail.com" }
+    { name = "Robert Kübler", email = "xgarve@gmail.com" }
 ]
+license = "MIT-0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = ["forecasting", "time-series", "exponential-smoothing", "holt-winters", "ets"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Cython",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Typing :: Typed",
+]
 dependencies = [
     "scipy>=1.11",
     "numpy>=1.26",
 ]
+
+[project.urls]
+Repository = "https://github.com/RobKuebler/multi-ets"
+Issues = "https://github.com/RobKuebler/multi-ets/issues"
 
 [dependency-groups]
 dev = [
