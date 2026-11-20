@@ -167,7 +167,10 @@ def test_custom_callable_loss_is_used_to_fit():
     ],
 )
 @pytest.mark.parametrize("kind,n_params", [("undamped", 4), ("damped", 5), ("ses", 2)])
-def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, delta, tau):
+@pytest.mark.parametrize("with_nan", [False, True])
+def test_hand_derived_grad_matches_finite_difference(
+    kind, n_params, loss_name, delta, tau, with_nan
+):
     # ExponentialSmoothing.fit()'s hand-derived BPTT gradient (_holt_objective_and_grad) must
     # agree with a finite-difference approximation, for every built-in loss
     # and every non-seasonal kind (undamped/damped/ses). #18/#19 cross-checked
@@ -177,6 +180,8 @@ def test_hand_derived_grad_matches_finite_difference(kind, n_params, loss_name, 
     h = 3
     y = np.cumsum(rng.normal(0, 1, 20)) + 10
     y = y - y.min() + 5.0  # poisson/negbinom/tweedie need non-negative y; don't rely on luck
+    if with_nan:
+        y[7:9] = np.nan  # gradient through skipped (missing) steps
     loss_key = (loss_name, delta, tau, 1.0, 1.5)
 
     p = rng.uniform(0.1, 0.9, n_params)
@@ -255,7 +260,10 @@ def _rand_seasonal_params(rng, kind, m, multiplicative):
         "seasonal_no_trend_mult",
     ],
 )
-def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, delta, tau):
+@pytest.mark.parametrize("with_nan", [False, True])
+def test_seasonal_hand_derived_grad_matches_finite_difference(
+    kind, loss_name, delta, tau, with_nan
+):
     # ExponentialSmoothing.fit()'s hand-derived seasonal BPTT
     # gradient (_seasonal_objective_and_grad) must agree with a
     # finite-difference approximation, for every built-in loss,
@@ -270,6 +278,8 @@ def test_seasonal_hand_derived_grad_matches_finite_difference(kind, loss_name, d
     # poisson/negbinom/tweedie need a non-negative y regardless of kind -- don't rely on
     # the unshifted random walk happening to stay positive for those rows.
     y = y - y.min() + 5.0
+    if with_nan:
+        y[7:9] = np.nan  # gradient through skipped (missing) steps
     loss_key = (loss_name, delta, tau, 1.0, 1.5)
     p = _rand_seasonal_params(rng, kind, m, multiplicative)
 
@@ -1040,7 +1050,7 @@ def test_tweedie_handles_zero_inflated_series_better_than_mse():
 # --- Missing-value support (#33: non-seasonal, #34: seasonal) ---
 
 
-def test_states_np_skip_and_carry_matches_hand_computation():
+def test_states_np_missing_step_advances_by_trend():
     y = np.array([1.0, 2.0, np.nan, 4.0, 5.0])
     alpha, beta = 0.5, 0.5
     levels, trends = holt_module._states_np(alpha, beta, 1.0, 0.0, 0.0, y)
@@ -1049,7 +1059,7 @@ def test_states_np_skip_and_carry_matches_hand_computation():
     expected_levels, expected_trends = [level], [trend]
     for yt in y:
         if np.isnan(yt):
-            new_level, new_trend = level, trend
+            new_level, new_trend = level + trend, trend
         else:
             new_level = alpha * yt + (1 - alpha) * (level + trend)
             new_trend = beta * (new_level - level) + (1 - beta) * trend
@@ -1098,6 +1108,17 @@ def test_trailing_nan_run_warns_once():
     with pytest.warns(UserWarning, match="ends with a run of NaN") as record:
         ExponentialSmoothing(trend="add", h=5, loss="mse").fit(y)
     assert len(record) == 1
+
+
+@pytest.mark.parametrize("seasonal_period", [None, 4])
+def test_trailing_nan_forecast_stays_on_trend(seasonal_period):
+    # A missing step must still advance the state by one trend step; carrying the
+    # level unchanged left the forecast one slope behind per trailing NaN.
+    y = 3.0 + 2.0 * np.arange(40)
+    y[-3:] = np.nan
+    with pytest.warns(UserWarning, match="ends with a run of NaN"):
+        model = ExponentialSmoothing(trend="add", seasonal_period=seasonal_period, h=5).fit(y)
+    np.testing.assert_allclose(model.predict(), 3.0 + 2.0 * np.arange(40, 45), atol=0.05)
 
 
 def test_leading_and_trailing_nan_runs_each_warn_once():

@@ -177,9 +177,9 @@ def objective_and_grad(
     for t in range(t_max):
         level = levels[t]
         trend = trends[t]
-        if isnan(y[t]):  # missing observation (#35): skip the update, carry state forward
-            new_level = level
-            new_trend = trend
+        if isnan(y[t]):  # missing observation: advance one step with no correction (alpha=0)
+            new_level = level + phi * trend
+            new_trend = phi * trend
         else:
             new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
             new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
@@ -242,9 +242,10 @@ def objective_and_grad(
     for t in range(n_origins - 1, 0, -1):
         gl_t = gl_direct[t] + gl_next
         gt_t = gt_direct[t] + gt_next
-        if isnan(y[t - 1]):  # skipped step (#35): identity backprop, no param gradient
+        if isnan(y[t - 1]):  # skipped step: the regular backprop with alpha=0
+            d_phi += trends[t - 1] * (gl_t + gt_t)
             gl_next = gl_t
-            gt_next = gt_t
+            gt_next = phi * (gl_t + gt_t)
             continue
         level_prev = levels[t - 1]
         trend_prev = trends[t - 1]
@@ -312,9 +313,9 @@ def seasonal_objective_and_grad(
         level = levels[t]
         trend = trends[t]
         s_old = season_bufs[t, 0]
-        if isnan(y[t]):  # missing observation (#36): skip the update, carry state forward
-            new_level = level
-            new_trend = trend
+        if isnan(y[t]):  # missing observation: advance one step with no correction (alpha=gamma=0)
+            new_level = level + phi * trend
+            new_trend = phi * trend
             new_season = s_old
         elif multiplicative:
             new_level = alpha * (y[t] / s_old) + (1 - alpha) * (level + phi * trend)
@@ -410,12 +411,12 @@ def seasonal_objective_and_grad(
             gb_cur[j] = gb_direct[t, j] + gb_next[j]
 
         if isnan(y[t - 1]):
-            # Skipped step (#36): level/trend pass through unchanged, and the
-            # season buffer just rotates (s_old is re-appended as new_season
-            # verbatim) -- no param gradient, and s_old's only outgoing edge
-            # is that rotation, so its gradient is the incoming tail gradient.
+            # Skipped step: the regular backprop with alpha=gamma=0 -- level/trend
+            # advance by phi * trend, and the season buffer just rotates (s_old
+            # is re-appended verbatim), so s_old gets the incoming tail gradient.
+            d_phi += trends[t - 1] * (gl + gt)
             gl_next = gl
-            gt_next = gt
+            gt_next = phi * (gl + gt)
             next_gb[0] = gb_cur[m - 1]
             for j in range(1, m):
                 next_gb[j] = gb_cur[j - 1]
