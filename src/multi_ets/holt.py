@@ -465,8 +465,8 @@ def _states_np(
     levels[0], trends[0] = level0, trend0
     for t in range(t_max):
         level, trend = levels[t], trends[t]
-        if np.isnan(y[t]):  # missing observation (#33): skip the update, carry state forward
-            new_level, new_trend = level, trend
+        if np.isnan(y[t]):  # missing observation: advance one step with no correction (alpha=0)
+            new_level, new_trend = level + phi * trend, phi * trend
         else:
             new_level = alpha * y[t] + (1 - alpha) * (level + phi * trend)
             new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
@@ -518,8 +518,9 @@ def _states_bptt_grad_np(
     for t in range(n_origins - 1, 0, -1):
         gl_t = gl_direct[t] + gl_next
         gt_t = gt_direct[t] + gt_next
-        if np.isnan(y[t - 1]):  # skipped step (#33): identity backprop, no param gradient
-            gl_next, gt_next = gl_t, gt_t
+        if np.isnan(y[t - 1]):  # skipped step: the regular backprop with alpha=0
+            d_phi += trends[t - 1] * (gl_t + gt_t)
+            gl_next, gt_next = gl_t, phi * (gl_t + gt_t)
             continue
         level_prev, trend_prev = levels[t - 1], trends[t - 1]
         y_prev = y[t - 1]
@@ -623,8 +624,8 @@ def _seasonal_states_np(
     for t in range(t_max):
         level, trend = levels[t], trends[t]
         s_old = season_bufs[t, 0]
-        if np.isnan(y[t]):  # missing observation (#34): skip the update, carry state forward
-            new_level, new_trend, new_season = level, trend, s_old
+        if np.isnan(y[t]):  # missing: advance one step, no correction (alpha=gamma=0)
+            new_level, new_trend, new_season = level + phi * trend, phi * trend, s_old
         elif multiplicative:
             new_level = alpha * (y[t] / s_old) + (1 - alpha) * (level + phi * trend)
             new_trend = beta * (new_level - level) + (1 - beta) * phi * trend
@@ -746,11 +747,11 @@ def _seasonal_states_bptt_grad_np(
         gb = gb_direct[t] + gb_next
 
         if np.isnan(y[t - 1]):
-            # Skipped step (#34): level/trend pass through unchanged, and the
-            # season buffer just rotates (s_old is re-appended as new_season
-            # verbatim) -- no param gradient, and s_old's only outgoing edge
-            # is that rotation, so its gradient is the incoming tail gradient.
-            gl_next, gt_next = gl, gt
+            # Skipped step: the regular backprop with alpha=gamma=0 -- level/trend
+            # advance by phi * trend, and the season buffer just rotates (s_old
+            # is re-appended verbatim), so s_old gets the incoming tail gradient.
+            d_phi += trends[t - 1] * (gl + gt)
+            gl_next, gt_next = gl, phi * (gl + gt)
             next_gb = np.empty(m)
             next_gb[0] = gb[-1]
             next_gb[1:] = gb[:-1]

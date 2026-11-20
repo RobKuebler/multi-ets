@@ -1,0 +1,3 @@
+# The sdist ships the Cython source (setup.py compiles it), not the generated C.
+include src/multi_ets/_holt_hot.pyx
+exclude src/multi_ets/_holt_hot.c

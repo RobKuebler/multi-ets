@@ -1,7 +1,7 @@
 """Verifies the _holt_hot seasonal core (issue #23) against holt.py's NumPy path.
 
-Skips cleanly if the extension hasn't been built (uv pip install cython &&
-uv run python setup.py build_ext --inplace in src/multi_ets/, see setup.py).
+Skips cleanly if the extension isn't built (e.g. MULTI_ETS_EXTENSION=skip, or no
+C compiler at install time -- see setup.py).
 """
 
 import numpy as np

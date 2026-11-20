@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Superseded by [0005](0005-ship-compiled-wheels.md): the extension is now
+compiled on every install and shipped as prebuilt wheels; the `[fast]` extra
+is gone.
 
 ## Context
 
