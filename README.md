@@ -118,8 +118,8 @@ from multi_ets import AutoExponentialSmoothing
 
 model = AutoExponentialSmoothing(h=5, seasonal_period=12, loss="mae").fit(y)
 forecasts = model.predict()
-model.best_     # the winning fitted ExponentialSmoothing
-model.scores_   # {candidate: mean_cv_loss}
+model.best_  # the winning fitted ExponentialSmoothing
+model.scores_  # {candidate: mean_cv_loss}
 ```
 
 It's named `AutoExponentialSmoothing` rather than `AutoETS`: `AutoETS` is statsforecast's name for
