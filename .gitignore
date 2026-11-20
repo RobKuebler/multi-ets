@@ -6,7 +6,11 @@ __pycache__/
 .coverage
 benchmarks/results/
 
-# Regenerable Cython build artifacts (issue #22) -- see src/multi_ets/setup.py.
-src/multi_ets/build/
+# Regenerable Cython build artifacts -- see setup.py.
+build/
+dist/
+wheelhouse/
+*.egg-info/
 src/multi_ets/_holt_hot.c
 src/multi_ets/_holt_hot*.so
+src/multi_ets/_holt_hot*.pyd

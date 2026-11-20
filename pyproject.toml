@@ -12,18 +12,6 @@ dependencies = [
     "numpy>=1.26",
 ]
 
-[project.optional-dependencies]
-# Compiled Cython hot loop (docs/adr/0001-cython-vs-rust-for-fitting-hot-loop.md,
-# docs/adr/0002-optional-compiled-extension.md): pulls in the Cython build tool
-# only, NOT a prebuilt wheel -- uv_build cannot compile extension modules, so
-# this extra alone does not build `_holt_hot`. See README.md's "Fast (optional
-# compiled) backend" section for the manual `setup.py build_ext --inplace`
-# step still required after `uv sync --extra fast` / `pip install -e ".[fast]"`.
-fast = [
-    "cython>=3.0",
-    "setuptools>=70",  # needed by src/multi_ets/setup.py's manual `build_ext --inplace` step
-]
-
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.2",
@@ -40,8 +28,40 @@ benchmark = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"
+# setuptools + Cython compile the `_holt_hot` extension on every install
+# (setup.py). Building against NumPy 2 yields extensions that also run on
+# NumPy 1.x, so the runtime `numpy>=1.26` floor still holds.
+# See docs/adr/0005-ship-compiled-wheels.md.
+requires = ["setuptools>=77", "cython>=3.0", "numpy>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+multi_ets = ["py.typed"]
+
+[tool.setuptools.exclude-package-data]
+multi_ets = ["*.pyx", "*.c"]
+
+[tool.uv]
+# Rebuild the editable install when the Cython source or build script changes.
+cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { file = "src/**/*.pyx" }]
+
+[tool.cibuildwheel]
+# Builds every CPython that requires-python allows. Free-threaded and 32-bit
+# builds are skipped (scipy ships no wheels for most of them).
+skip = ["cp3??t-*", "*-win32", "*_i686"]
+environment = { MULTI_ETS_EXTENSION = "required" }
+test-requires = ["pytest", "pytest-cov"]
+# Fail if the wheel lacks the extension (the hot-loop tests would only skip).
+test-command = [
+    'python -c "import multi_ets._holt_hot"',
+    "pytest {project}/tests/test_holt_hot.py {project}/tests/test_seasonal_hot.py -q -p no:cacheprovider",
+]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
 
 [tool.ruff]
 target-version = "py312"
@@ -68,9 +88,3 @@ addopts = "--cov=multi_ets --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["src/multi_ets"]
-
-[tool.ty.src]
-# setup.py imports Cython/setuptools, which are only installed under the
-# optional `[fast]` extra (see docs/adr/0002) -- the plain `dev` group ty
-# runs under (pre-commit, CI) can't resolve them.
-exclude = ["src/multi_ets/setup.py"]

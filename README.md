@@ -144,26 +144,21 @@ ExponentialSmoothing(h=5, trend="add", loss=lambda yt, yp: (yt - yp).var()).fit(
 
 Fitting is non-convex, so each model restarts from `n_starts` (default 10) points spread across the parameter box and keeps the best, via a plain Python loop over `scipy.optimize.minimize`.
 
-### Fast (optional compiled) backend
+### Compiled backend
 
-`multi_ets` installs and runs correctly as a pure-Python wheel with zero C toolchain. A compiled
-Cython hot loop (the fit objective + hand-derived gradient) is available as an opt-in speedup for
-every built-in loss (`mse`/`mae`/`huber`/`pinball`/`poisson`/`negbinom`/`tweedie`/`expectile`/
-`logcosh`); a custom callable `loss` always uses the NumPy path. When the compiled extension isn't
-built, everything silently falls back to NumPy -- nothing breaks either way. See
-`docs/adr/0002-optional-compiled-extension.md` for the full decision.
+The fit objective + hand-derived gradient for every built-in loss (`mse`/`mae`/`huber`/`pinball`/
+`poisson`/`negbinom`/`tweedie`/`expectile`/`logcosh`) runs in a compiled Cython extension. PyPI ships
+prebuilt wheels for Linux, macOS and Windows (x86_64 and ARM), so `pip install multi-ets` gets the
+fast version with no compiler needed. A custom callable `loss` always uses the NumPy path.
 
-To build it:
+On a platform without a prebuilt wheel, pip builds from source. If no C compiler is available, the
+install still succeeds with a warning and `multi_ets` falls back to the slower NumPy path -- results
+are the same either way. See `docs/adr/0005-ship-compiled-wheels.md`.
 
-```bash
-uv sync --extra fast   # or: pip install -e ".[fast]" -- installs cython + setuptools
-cd src/multi_ets && uv run python setup.py build_ext --inplace
-```
-
-Note: `uv sync --extra fast` alone does **not** build the extension -- this project's build backend
-(`uv_build`) only supports pure-Python packages and has no hook for compiling `.pyx` files as part
-of install. The `build_ext --inplace` step above is a real, separate manual step, not optional
-boilerplate.
+For development, `uv sync` (or `pip install -e .`) compiles the extension automatically and
+recompiles it when `_holt_hot.pyx` changes. The `MULTI_ETS_EXTENSION` environment variable
+controls the build: `optional` (default), `required` (fail if compiling fails) or `skip`
+(pure Python).
 
 ## Model overview
 

@@ -1,0 +1,56 @@
+name: Release
+
+# Builds compiled wheels for Linux/macOS/Windows plus an sdist and publishes
+# them to PyPI when a GitHub release is published (docs/adr/0005).
+# Uses PyPI trusted publishing: no API token, but the PyPI project must list
+# this repo + workflow (release.yml) + environment (pypi) as a trusted publisher.
+# Run it manually (workflow_dispatch) to build and inspect the artifacts
+# without publishing.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  wheels:
+    name: wheels (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest builds both x86_64 and arm64 (pyproject.toml's
+        # [tool.cibuildwheel.macos]); ubuntu-24.04-arm builds native aarch64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pypa/cibuildwheel@v3.4.1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    needs: [wheels, sdist]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
