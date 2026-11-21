@@ -62,6 +62,8 @@ class _MultiETSBase(BaseForecaster):
         if insample.any():
             core = self._core()
             pos = self._series.index.get_indexer(fh.to_absolute_index(self.cutoff)[insample])
+            if (pos < 0).any():
+                raise ValueError("in-sample fh points must lie within the training series")
             if alpha is None:
                 cols = core.predict_in_sample(self.insample_step)[:, None]
             else:
