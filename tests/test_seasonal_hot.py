@@ -35,7 +35,7 @@ _LOSSES = (
 _SEED = {(loss, kind): i for i, (loss, kind) in enumerate((L, K) for L in _LOSSES for K in _KINDS)}
 _DELTA = 0.7  # deliberately not the default 1.0, to exercise huber's clip boundary
 _TAU = 0.3  # deliberately not the default 0.5, to exercise pinball's/expectile's asymmetry
-_NB_ALPHA = 0.8  # deliberately not the default 1.0, to exercise negbinom's dispersion term
+_DISPERSION = 0.8  # deliberately not the default 1.0, to exercise negbinom's dispersion term
 _TW_P = 1.3  # deliberately not the default 1.5, to exercise tweedie's power parameter
 _M = 4  # season length
 
@@ -66,7 +66,7 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
     y = rng.uniform(15, 25, 40) if multiplicative else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
     h = 5
     params = _random_params(kind, rng, multiplicative)
-    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _DISPERSION, _TW_P)
 
     value_np, grad_np = holt_module._seasonal_objective_and_grad(params, y, h, kind, _M, loss_key)
 
@@ -75,7 +75,7 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
     )
     full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
     value_c, grad_c_full = _holt_hot.seasonal_objective_and_grad(
-        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
+        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU, _DISPERSION, _TW_P
     )
     grad_c = holt_module._PACK_GRAD_SEASONAL_BY_KIND[kind](
         (
@@ -158,7 +158,7 @@ def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
     y[21] = np.nan
     h = 5
     params = _random_params(kind, rng, multiplicative)
-    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _DISPERSION, _TW_P)
 
     value_np, grad_np = holt_module._seasonal_objective_and_grad(params, y, h, kind, _M, loss_key)
 
@@ -167,7 +167,7 @@ def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
     )
     full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
     value_c, grad_c_full = _holt_hot.seasonal_objective_and_grad(
-        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
+        full, y, h, _M, int(multiplicative), _LOSS_ID[loss], _DELTA, _TAU, _DISPERSION, _TW_P
     )
     grad_c = holt_module._PACK_GRAD_SEASONAL_BY_KIND[kind](
         (
@@ -221,7 +221,7 @@ def test_matches_numpy_reference_with_sample_weight(kind: str) -> None:
     sample_weight = rng.uniform(0.1, 2.0, len(y))
     h = 5
     params = _random_params(kind, rng, multiplicative)
-    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _NB_ALPHA, _TW_P)
+    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _DISPERSION, _TW_P)
 
     value_np, grad_np = holt_module._seasonal_objective_and_grad(
         params, y, h, kind, _M, loss_key, sample_weight=sample_weight
@@ -240,7 +240,7 @@ def test_matches_numpy_reference_with_sample_weight(kind: str) -> None:
         _LOSS_ID["mse"],
         _DELTA,
         _TAU,
-        _NB_ALPHA,
+        _DISPERSION,
         _TW_P,
         sample_weight,
     )
@@ -285,3 +285,42 @@ def test_weighted_fit_dispatches_to_compiled_backend(
         h=3, trend=trend, seasonal_period=_M, seasonal_type=seasonal_type, n_starts=2, loss="mse"
     ).fit(y, sample_weight=sample_weight)
     assert calls, "a weighted fit did not call the compiled backend"
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_matches_numpy_reference_with_list_h(kind: str) -> None:
+    """A non-contiguous list h's per-step weight must match the NumPy path, NaNs included."""
+    rng = np.random.default_rng(_SEED["mse", kind] + 300)
+    multiplicative = kind in holt_module._MULTIPLICATIVE_KINDS
+    y = rng.uniform(15, 25, 40) if multiplicative else np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[[5, 20, 21]] = np.nan
+    h, _, step_weight = holt_module._resolve_steps([2, 3, 6])
+    params = _random_params(kind, rng, multiplicative)
+    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _DISPERSION, _TW_P)
+
+    value_np, grad_np = holt_module._seasonal_objective_and_grad(
+        params, y, h, kind, _M, loss_key, step_weight=step_weight
+    )
+
+    alpha, beta, phi, gamma, level0, trend0, season0 = holt_module._UNPACK_SEASONAL_BY_KIND[kind](
+        params, _M
+    )
+    full = np.concatenate([[alpha, beta, phi, gamma, level0, trend0], season0])
+    value_c, grad_c_full = _holt_hot.seasonal_objective_and_grad(
+        full,
+        y,
+        h,
+        _M,
+        int(multiplicative),
+        _LOSS_ID["mse"],
+        _DELTA,
+        _TAU,
+        _DISPERSION,
+        _TW_P,
+        None,
+        step_weight,
+    )
+    grad_c = holt_module._PACK_GRAD_SEASONAL_BY_KIND[kind]((*grad_c_full[:6], grad_c_full[6:]))
+
+    assert value_c == pytest.approx(value_np, abs=1e-12)
+    np.testing.assert_allclose(grad_c, grad_np, atol=1e-12)

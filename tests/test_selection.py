@@ -110,3 +110,18 @@ def test_auto_exponential_smoothing_predict_before_fit_raises():
     model = AutoExponentialSmoothing(h=3)
     with pytest.raises(ValueError, match="not fitted"):
         model.predict()
+
+
+def test_select_model_with_list_h_scores_listed_steps():
+    y = 3.0 + 2.0 * np.arange(40)
+    candidates = [ExponentialSmoothing(h=[1, 4]), ExponentialSmoothing(trend="add", h=[1, 4])]
+    best, scores = select_model(candidates, y, n_splits=2)
+    assert best.trend == "add"
+    assert best.predict().shape == (2,)
+    assert len(scores) == 2
+
+
+def test_auto_exponential_smoothing_with_list_h():
+    y = 3.0 + 2.0 * np.arange(40)
+    model = AutoExponentialSmoothing(h=[2, 5], n_starts=2, n_splits=2).fit(y)
+    np.testing.assert_allclose(model.predict(), y[-1] + 2.0 * np.array([2, 5]), atol=1e-2)

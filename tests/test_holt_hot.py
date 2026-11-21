@@ -28,7 +28,7 @@ _LOSSES = (
 _SEED = {(loss, kind): i for i, (loss, kind) in enumerate((L, K) for L in _LOSSES for K in _KINDS)}
 _DELTA = 0.7  # deliberately not the default 1.0, to exercise huber's clip boundary
 _TAU = 0.3  # deliberately not the default 0.5, to exercise pinball's/expectile's asymmetry
-_NB_ALPHA = 0.8  # deliberately not the default 1.0, to exercise negbinom's dispersion term
+_DISPERSION = 0.8  # deliberately not the default 1.0, to exercise negbinom's dispersion term
 _TW_P = 1.3  # deliberately not the default 1.5, to exercise tweedie's power parameter
 
 
@@ -52,13 +52,13 @@ def test_matches_numpy_reference(loss: str, kind: str) -> None:
     y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
     h = 5
     params = _random_params(kind, rng)
-    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _DISPERSION, _TW_P)
 
     value_np, grad_np = holt_module._holt_objective_and_grad(params, y, h, kind, loss_key)
 
     full5 = np.asarray(holt_module._UNPACK_BY_KIND[kind](params), dtype=float)
     value_c, grad5_c = _holt_hot.objective_and_grad(
-        full5, y, h, _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
+        full5, y, h, _LOSS_ID[loss], _DELTA, _TAU, _DISPERSION, _TW_P
     )
     grad_c = holt_module._PACK_GRAD_BY_KIND[kind](grad5_c)
 
@@ -118,13 +118,13 @@ def test_matches_numpy_reference_with_nan_actuals(loss: str, kind: str) -> None:
     y[21] = np.nan
     h = 5
     params = _random_params(kind, rng)
-    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _NB_ALPHA, _TW_P)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _DISPERSION, _TW_P)
 
     value_np, grad_np = holt_module._holt_objective_and_grad(params, y, h, kind, loss_key)
 
     full5 = np.asarray(holt_module._UNPACK_BY_KIND[kind](params), dtype=float)
     value_c, grad5_c = _holt_hot.objective_and_grad(
-        full5, y, h, _LOSS_ID[loss], _DELTA, _TAU, _NB_ALPHA, _TW_P
+        full5, y, h, _LOSS_ID[loss], _DELTA, _TAU, _DISPERSION, _TW_P
     )
     grad_c = holt_module._PACK_GRAD_BY_KIND[kind](grad5_c)
 
@@ -160,7 +160,7 @@ def test_matches_numpy_reference_with_sample_weight(kind: str) -> None:
     sample_weight = rng.uniform(0.1, 2.0, len(y))
     h = 5
     params = _random_params(kind, rng)
-    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _NB_ALPHA, _TW_P)
+    loss_key = holt_module._loss_key("mse", _DELTA, _TAU, _DISPERSION, _TW_P)
 
     value_np, grad_np = holt_module._holt_objective_and_grad(
         params, y, h, kind, loss_key, sample_weight=sample_weight
@@ -168,7 +168,7 @@ def test_matches_numpy_reference_with_sample_weight(kind: str) -> None:
 
     full5 = np.asarray(holt_module._UNPACK_BY_KIND[kind](params), dtype=float)
     value_c, grad5_c = _holt_hot.objective_and_grad(
-        full5, y, h, _LOSS_ID["mse"], _DELTA, _TAU, _NB_ALPHA, _TW_P, sample_weight
+        full5, y, h, _LOSS_ID["mse"], _DELTA, _TAU, _DISPERSION, _TW_P, sample_weight
     )
     grad_c = holt_module._PACK_GRAD_BY_KIND[kind](grad5_c)
 
@@ -196,3 +196,41 @@ def test_weighted_fit_dispatches_to_compiled_backend(
         y, sample_weight=sample_weight
     )
     assert calls, "a weighted fit did not call the compiled backend"
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("loss", ["mse", "negbinom"])
+def test_matches_numpy_reference_with_list_h(loss: str, kind: str) -> None:
+    """A non-contiguous list h's per-step weight must match the NumPy path, NaNs included."""
+    rng = np.random.default_rng(_SEED[loss, kind] + 300)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[[5, 20, 21]] = np.nan
+    sample_weight = rng.uniform(0.1, 2.0, len(y))
+    h, _, step_weight = holt_module._resolve_steps([1, 2, 5, 7])
+    params = _random_params(kind, rng)
+    loss_key = holt_module._loss_key(loss, _DELTA, _TAU, _DISPERSION, _TW_P)
+
+    value_np, grad_np = holt_module._holt_objective_and_grad(
+        params, y, h, kind, loss_key, sample_weight=sample_weight, step_weight=step_weight
+    )
+
+    full5 = np.asarray(holt_module._UNPACK_BY_KIND[kind](params), dtype=float)
+    value_c, grad5_c = _holt_hot.objective_and_grad(
+        full5, y, h, _LOSS_ID[loss], _DELTA, _TAU, _DISPERSION, _TW_P, sample_weight, step_weight
+    )
+    grad_c = holt_module._PACK_GRAD_BY_KIND[kind](grad5_c)
+
+    assert value_c == pytest.approx(value_np, abs=1e-9)
+    np.testing.assert_allclose(grad_c, grad_np, atol=1e-9)
+
+
+@pytest.mark.parametrize("trend", ["add", None, "damped"])
+def test_list_h_fit_matches_numpy_fallback(trend: str | None, monkeypatch: pytest.MonkeyPatch):
+    """End-to-end: a list-h fit gives the same forecasts with and without the extension."""
+    rng = np.random.default_rng(1)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[12] = np.nan
+    compiled = ExponentialSmoothing(h=[1, 3, 4], trend=trend, n_starts=3).fit(y).predict()
+    monkeypatch.setattr(holt_module, "_holt_hot", None)
+    fallback = ExponentialSmoothing(h=[1, 3, 4], trend=trend, n_starts=3).fit(y).predict()
+    np.testing.assert_allclose(compiled, fallback, rtol=1e-5)

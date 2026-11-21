@@ -769,7 +769,7 @@ def test_attribute_set_after_construction_is_honored_at_fit():
         ("huber", {"delta": 0.8}),
         ("pinball", {"tau": 0.4}),
         ("poisson", {}),
-        ("negbinom", {"alpha": 2.0}),
+        ("negbinom", {"dispersion": 2.0}),
         ("tweedie", {"p": 1.3}),
         ("expectile", {"tau": 0.3}),
         ("logcosh", {}),
@@ -919,49 +919,49 @@ def test_negbinom_smoke_fits_for_all_model_kinds():
     rng = np.random.default_rng(9)
     y = rng.poisson(10, size=30).astype(float)
 
-    assert ExponentialSmoothing(trend="add", h=3, loss="negbinom", alpha=1.0).fit(
+    assert ExponentialSmoothing(trend="add", h=3, loss="negbinom", dispersion=1.0).fit(
         y
     ).predict().shape == (3,)
-    assert ExponentialSmoothing(h=3, loss="negbinom", alpha=1.0).fit(y).predict().shape == (3,)
-    assert ExponentialSmoothing(trend="damped", h=3, loss="negbinom", alpha=1.0).fit(
+    assert ExponentialSmoothing(h=3, loss="negbinom", dispersion=1.0).fit(y).predict().shape == (3,)
+    assert ExponentialSmoothing(trend="damped", h=3, loss="negbinom", dispersion=1.0).fit(
         y
     ).predict().shape == (3,)
 
     y_seasonal = rng.poisson(10, size=40).astype(float)
     forecasts = (
-        ExponentialSmoothing(trend="add", h=3, seasonal_period=4, loss="negbinom", alpha=1.0)
+        ExponentialSmoothing(trend="add", h=3, seasonal_period=4, loss="negbinom", dispersion=1.0)
         .fit(y_seasonal)
         .predict()
     )
     assert forecasts.shape == (3,)
 
 
-def test_non_positive_negbinom_alpha_raises():
-    with pytest.raises(ValueError, match="alpha"):
-        ExponentialSmoothing(trend="add", h=3, loss="negbinom", alpha=0.0)
-    with pytest.raises(ValueError, match="alpha"):
-        ExponentialSmoothing(trend="add", h=3, loss="negbinom", alpha=-1.0)
+def test_non_positive_negbinom_dispersion_raises():
+    with pytest.raises(ValueError, match="dispersion"):
+        ExponentialSmoothing(trend="add", h=3, loss="negbinom", dispersion=0.0)
+    with pytest.raises(ValueError, match="dispersion"):
+        ExponentialSmoothing(trend="add", h=3, loss="negbinom", dispersion=-1.0)
 
 
 def test_negbinom_negative_y_raises():
     y = np.array([1.0, 2.0, -1.0, 3.0, 4.0, 5.0])
     with pytest.raises(ValueError, match="non-negative"):
-        ExponentialSmoothing(trend="add", h=2, loss="negbinom", alpha=1.0).fit(y)
+        ExponentialSmoothing(trend="add", h=2, loss="negbinom", dispersion=1.0).fit(y)
 
 
 def test_negbinom_achieves_lower_negbinom_deviance_than_poisson_on_overdispersed_counts():
     # Overdispersed count series (variance well above the mean): a model
     # fit by minimizing Poisson deviance (which assumes variance == mean)
     # gets pulled differently by the extra variance than one that accounts
-    # for it via negbinom's alpha, so under negbinom's own deviance the
+    # for it via negbinom's dispersion, so under negbinom's own deviance the
     # negbinom-fit model should score better. loss="poisson" isn't
     # implemented in this worktree yet (#26, sibling issue), so the
     # comparison model is fit against the documented Poisson deviance
     # formula directly, via a custom callable loss.
     rng = np.random.default_rng(8)
     h = 3
-    mu, alpha_true = 30.0, 0.3
-    p = 1.0 / (1.0 + alpha_true * mu)
+    mu, dispersion_true = 30.0, 0.3
+    p = 1.0 / (1.0 + dispersion_true * mu)
     n = mu * p / (1.0 - p)
     y = rng.negative_binomial(n, p, size=40).astype(float)
 
@@ -973,7 +973,7 @@ def test_negbinom_achieves_lower_negbinom_deviance_than_poisson_on_overdispersed
         return dev.mean()
 
     negbinom_fit = ExponentialSmoothing(
-        trend="add", h=h, loss="negbinom", alpha=alpha_true, n_starts=5
+        trend="add", h=h, loss="negbinom", dispersion=dispersion_true, n_starts=5
     ).fit(y)
     poisson_fit = ExponentialSmoothing(trend="add", h=h, loss=poisson_deviance, n_starts=5).fit(y)
 
@@ -984,7 +984,7 @@ def test_negbinom_achieves_lower_negbinom_deviance_than_poisson_on_overdispersed
         poisson_fit.params_, y, h, poisson_fit._kind
     )
 
-    loss_key = ("negbinom", 1.0, 0.5, alpha_true, 1.5)
+    loss_key = ("negbinom", 1.0, 0.5, dispersion_true, 1.5)
     dev_nb = holt_module._loss_value_np(loss_key, actuals_nb, forecasts_nb)
     dev_pois = holt_module._loss_value_np(loss_key, actuals_pois, forecasts_pois)
 
@@ -1295,3 +1295,72 @@ def test_heuristic_seasonal_init_multiplicative_degenerate_single_valid_point():
     assert level0 == pytest.approx(5.0)
     assert trend0 == pytest.approx(0.0)
     np.testing.assert_allclose(season0, np.ones(4))
+
+
+def test_list_h_contiguous_matches_int_h():
+    rng = np.random.default_rng(0)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    by_int = ExponentialSmoothing(trend="add", h=5, n_starts=3).fit(y)
+    by_list = ExponentialSmoothing(trend="add", h=[5, 4, 3, 2, 1], n_starts=3).fit(y)
+    np.testing.assert_array_equal(by_list.params_, by_int.params_)
+    np.testing.assert_array_equal(by_list.predict(), by_int.predict())
+
+
+@pytest.mark.parametrize("kind,m", [("undamped", None), ("damped_seasonal", 4)])
+def test_list_h_objective_counts_only_listed_steps(kind, m):
+    # With h=[1, 3] the joint loss must be plain MSE over horizon columns 0 and 2
+    # only (NaN actuals dropped), so it differs from the h=3 loss over all three.
+    rng = np.random.default_rng(1)
+    y = np.cumsum(rng.normal(0.5, 1.0, 30)) + 20
+    y[[7, 15]] = np.nan
+    loss_key = holt_module._loss_key("mse", 1.0, 0.5)
+    h, idx, step_weight = holt_module._resolve_steps([3, 1])
+    if m is None:
+        params = np.array([0.3, 0.2, 18.0, 0.5])
+        *_, forecasts, actuals = holt_module._holt_forward_np(params, y, h, kind)
+        value, _ = holt_module._holt_objective_and_grad(
+            params, y, h, kind, loss_key, step_weight=step_weight
+        )
+        full, _ = holt_module._holt_objective_and_grad(params, y, h, kind, loss_key)
+    else:
+        params = np.concatenate([[0.3, 0.2, 0.9, 0.1, 18.0, 0.5], rng.normal(0, 1, m)])
+        forecasts, actuals = holt_module._seasonal_forward_np(params, y, h, kind, m)[-2:]
+        value, _ = holt_module._seasonal_objective_and_grad(
+            params, y, h, kind, m, loss_key, step_weight=step_weight
+        )
+        full, _ = holt_module._seasonal_objective_and_grad(params, y, h, kind, m, loss_key)
+    assert list(idx) == [0, 2]
+    assert value == pytest.approx(np.nanmean((forecasts[:, idx] - actuals[:, idx]) ** 2))
+    assert value != pytest.approx(full)
+
+
+def test_list_h_predict_and_interval_return_listed_steps():
+    rng = np.random.default_rng(2)
+    y = np.cumsum(rng.normal(0.5, 1.0, 40)) + 20
+    y[10] = np.nan
+    model = ExponentialSmoothing(trend="add", h=[7, 1, 2], n_starts=3).fit(y)
+    full = ExponentialSmoothing(trend="add", h=7, n_starts=3)
+    full.params_, full._y = model.params_, model._y  # same fitted state, all steps 1..7
+    np.testing.assert_array_equal(model.predict(), full.predict()[[0, 1, 6]])
+    bounds, full_bounds = model.predict_interval(), full.predict_interval()
+    assert isinstance(bounds, tuple) and isinstance(full_bounds, tuple)
+    for bound, full_bound in zip(bounds, full_bounds, strict=True):
+        np.testing.assert_array_equal(bound, full_bound[[0, 1, 6]])
+
+
+def test_list_h_custom_loss_sees_only_listed_steps():
+    seen = []
+
+    def mse(y_true, y_pred):
+        seen.append(y_pred.shape[1])
+        return np.mean((y_pred - y_true) ** 2)
+
+    y = 3.0 + 2.0 * np.arange(20)
+    ExponentialSmoothing(trend="add", h=[2, 4], loss=mse, n_starts=1).fit(y)
+    assert set(seen) == {2}
+
+
+@pytest.mark.parametrize("h", [[], [0, 1], [1, 1], [1.5], [-2], [True]])
+def test_invalid_list_h_raises(h):
+    with pytest.raises(ValueError, match="h must be"):
+        ExponentialSmoothing(h=h)
