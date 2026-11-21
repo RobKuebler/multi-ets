@@ -85,14 +85,26 @@ fitted parameters are in `.params_` after `fit()`.
 
 ### Prediction intervals
 
-Every model exposes `.predict_interval(coverage=0.9)` after fitting, returning an empirical
-per-horizon-step Gaussian interval built from residuals of the fitted joint loss:
+Every model exposes `.predict_interval(coverage=0.9)` after fitting. Each horizon step `k` gets
+the point forecast plus empirical quantiles of the step-`k` in-sample residuals (actual - forecast
+over every training origin), so a biased or skewed fit gives an asymmetric interval. With fewer
+than 30 residuals for a step it warns and falls back to a Gaussian with the residuals' mean and
+std (see `docs/adr/0006`). In-sample residuals are optimistic; for calibrated coverage wrap the
+model in sktime's `ConformalIntervals`.
 
 ```python
-lower, upper = ExponentialSmoothing(h=5, trend="add").fit(y).predict_interval(coverage=0.9)
+model = ExponentialSmoothing(h=5, trend="add").fit(y)
+lower, upper = model.predict_interval(coverage=0.9)
 
 # A list of coverages returns a {coverage: (lower, upper)} dict instead.
-intervals = ExponentialSmoothing(h=5, trend="add").fit(y).predict_interval(coverage=[0.5, 0.9])
+intervals = model.predict_interval(coverage=[0.5, 0.9])
+
+# Arbitrary quantiles, shape (n_steps, n_alphas).
+quantiles = model.predict_quantiles([0.1, 0.5, 0.9])
+
+# In-sample k-step-ahead predictions (first k - 1 values NaN), optionally with quantiles.
+fitted = model.predict_in_sample(step=1)
+fitted, quantiles = model.predict_in_sample(step=2, alphas=[0.1, 0.9])
 ```
 
 ### Model selection

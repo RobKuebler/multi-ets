@@ -1,9 +1,10 @@
 """Holt's linear trend model, fit by minimizing a joint h-step-ahead loss."""
 
 import itertools
+import os
 import warnings
 from collections.abc import Callable, Sequence
-from typing import Any, Self
+from typing import Any, Self, overload
 
 import numpy as np
 from scipy.optimize import minimize
@@ -21,6 +22,11 @@ _BOUND_EPS = 1e-4
 # Athanasopoulos); phi
 # approaching 1 means "no damping", which defeats the point of a damped model.
 _PHI_UPPER = 0.98
+# Below this many non-NaN residuals at a horizon step, predict_quantiles falls
+# back to a Gaussian (docs/adr/0006): an empirical tail quantile needs data.
+# ponytail: fixed cutoff regardless of alpha (a 1% tail wants far more than 30),
+# upgrade path is an alpha-dependent minimum count if it ever matters.
+_MIN_RESIDUALS = 30
 
 
 def _loss_key(
@@ -1143,8 +1149,7 @@ class ExponentialSmoothing:
 
     def predict(self) -> np.ndarray:
         """Forecast the requested horizon steps (1..h, or the listed ones) from the fitted state."""
-        if self.params_ is None:
-            raise ValueError("Model is not fitted yet; call .fit(y) first")
+        self._check_fitted()
         h, idx, _ = _resolve_steps(self.h)
         return self._forecast(h)[idx]
 
@@ -1207,48 +1212,117 @@ class ExponentialSmoothing:
             self.params_[n] += c
             self.params_[n + nf : n + nf + m] -= c
 
-    def _resid_std(self) -> np.ndarray:
-        """Per-requested-horizon-step std of (actual - forecast) across every valid training origin.
+    def _residuals(self, h: int) -> tuple[np.ndarray, np.ndarray]:
+        """(forecasts, residuals), each (len(y), h): origin o's step-k forecast, actual - forecast.
 
-        Recomputes the forecast matrix from the fitted params, dispatching
-        seasonal vs. non-seasonal by _kind exactly like the fit objective
-        functions do. Not cached: it's one cheap forward pass, and caching
-        risks staleness across refits.
-
-        With very short series (few valid origins) this degenerates, e.g. a
-        single origin gives 0 std and an all-zero-width interval -- accepted
-        as a known limitation rather than guarded against here. Likewise (#33),
-        a NaN gap wide enough to blank out every origin's actual at a given
-        horizon step gives that step a NaN std (and so a NaN interval).
+        One forward pass with the fitted params over y padded by h - 1 trailing
+        NaNs, so every origin 0..len(y)-1 is kept for every step (levels[o]
+        only depends on y[:o], so the pad changes nothing before it); cells
+        whose actual is a pad or a NaN gap (#33) get a NaN residual.
+        Origin 0 is the fitted initial state, scored by the joint loss too.
         """
-        assert self.params_ is not None  # called only from predict_interval(), already checked
-        h, idx, _ = _resolve_steps(self.h)
+        assert self.params_ is not None  # callers check
+        y = np.concatenate([self._y, np.full(h - 1, np.nan)])
         if self._kind in _SEASONAL_KINDS:
             m = self.seasonal_period or 0  # 0: dummy, unreachable since we're in a seasonal kind
-            *_, forecasts, actuals = _seasonal_forward_np(self.params_, self._y, h, self._kind, m)
+            *_, forecasts, actuals = _seasonal_forward_np(self.params_, y, h, self._kind, m)
         else:
-            *_, forecasts, actuals = _holt_forward_np(self.params_, self._y, h, self._kind)
-        # nanstd (#33): a NaN actual contributes no residual, matching the
-        # same cells the fit's own joint loss zero-weights (_nan_actual_mask).
-        return np.nanstd(actuals - forecasts, axis=0)[idx]
+            *_, forecasts, actuals = _holt_forward_np(self.params_, y, h, self._kind)
+        return forecasts, actuals - forecasts
+
+    def _resid_quantiles(self, steps: Any, alphas: Any) -> np.ndarray:
+        """(len(steps), len(alphas)) empirical alphas-quantiles of the step-k in-sample residuals.
+
+        steps are 1-based horizon steps. A step with fewer than
+        _MIN_RESIDUALS non-NaN residuals falls back to a Gaussian with the
+        residuals' own mean and std (NaN if it has none), with one warning
+        per call. See docs/adr/0006.
+        """
+        resid = self._residuals(int(max(steps)))[1]
+        out = np.full((len(steps), len(alphas)), np.nan)
+        short = []
+        for i, k in enumerate(steps):
+            r = resid[:, k - 1]
+            r = r[~np.isnan(r)]
+            if len(r) >= _MIN_RESIDUALS:
+                out[i] = np.quantile(r, alphas)
+                continue
+            short.append(int(k))
+            if len(r):
+                out[i] = r.mean() + norm.ppf(alphas) * r.std()
+        if short:
+            warnings.warn(
+                f"fewer than {_MIN_RESIDUALS} in-sample residuals for horizon step(s) {short}; "
+                "using a Gaussian approximation (NaN where there are none)",
+                UserWarning,
+                skip_file_prefixes=(os.path.dirname(__file__),),
+            )
+        return out
+
+    def _check_fitted(self) -> None:
+        if self.params_ is None:
+            raise ValueError("Model is not fitted yet; call .fit(y) first")
+
+    def predict_quantiles(self, alphas: float | Sequence[float]) -> np.ndarray:
+        """(n_steps, n_alphas) forecast quantiles: predict() + empirical step-k residual quantile.
+
+        alphas: a float or a sequence of floats in (0, 1). Residuals are
+        actual - forecast over every training origin (docs/adr/0006), so any
+        bias/skew of the fit carries into the quantiles.
+        """
+        self._check_fitted()
+        _, idx, _ = _resolve_steps(self.h)
+        return self.predict()[:, None] + self._resid_quantiles(idx + 1, np.atleast_1d(alphas))
 
     def predict_interval(
         self, coverage: float | list[float] | tuple[float, ...] = 0.9
     ) -> tuple[np.ndarray, np.ndarray] | dict[float, tuple[np.ndarray, np.ndarray]]:
-        """Empirical per-horizon-step Gaussian interval(s) around .predict().
+        """Per-horizon-step interval(s) from empirical residual quantiles (see predict_quantiles).
 
         coverage: a single float -> (lower, upper) array pair; a list of
         floats -> {coverage: (lower, upper)} dict.
         """
-        if self.params_ is None:
-            raise ValueError("Model is not fitted yet; call .fit(y) first")
-        point = self.predict()
-        std = self._resid_std()
+        coverages = list(coverage) if isinstance(coverage, (list, tuple)) else [coverage]
+        alphas = [a for c in coverages for a in ((1 - c) / 2, (1 + c) / 2)]
+        q = self.predict_quantiles(alphas)
+        bounds = {c: (q[:, 2 * i], q[:, 2 * i + 1]) for i, c in enumerate(coverages)}
+        return bounds if isinstance(coverage, (list, tuple)) else bounds[coverage]
 
-        def bounds(c: float) -> tuple[np.ndarray, np.ndarray]:
-            z = norm.ppf(0.5 + c / 2)
-            return point - z * std, point + z * std
+    @overload
+    def predict_in_sample(self, step: int = 1, alphas: None = None) -> np.ndarray: ...
+    @overload
+    def predict_in_sample(
+        self, step: int, alphas: float | Sequence[float]
+    ) -> tuple[np.ndarray, np.ndarray]: ...
+    @overload
+    def predict_in_sample(
+        self, step: int = 1, *, alphas: float | Sequence[float]
+    ) -> tuple[np.ndarray, np.ndarray]: ...
+    def predict_in_sample(
+        self, step: int = 1, alphas: float | Sequence[float] | None = None
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        """In-sample step-ahead predictions, one per training point, with optional quantiles.
 
-        if isinstance(coverage, (list, tuple)):
-            return {c: bounds(c) for c in coverage}
-        return bounds(coverage)
+        pred[t] is the forecast of y[t] made step steps earlier, i.e. from
+        origin t - step + 1 (the state after seeing y[:t - step + 1]) with the
+        fitted params -- what predict()[step - 1] gives for a model holding
+        these same params_ but trained on y[:t - step + 1]. Origin 0 is the fitted
+        initial state (scored by the joint loss), so only the first step - 1
+        values have no origin and are NaN; pred[0] at step=1 is the initial
+        state's one-step forecast.
+
+        alphas: None -> pred, shape (len(y),); a float or sequence of floats in
+        (0, 1) -> (pred, quantiles), quantiles shape (len(y), n_alphas), each
+        pred + the empirical residual quantile at this step (same rules as
+        predict_quantiles). These residuals are in-sample, so they are
+        optimistic for the very points they were computed on.
+        """
+        self._check_fitted()
+        if step < 1:
+            raise ValueError(f"step must be a positive int, got {step}")
+        forecasts = self._residuals(step)[0]
+        n = len(self._y)
+        pred = np.concatenate([np.full(step - 1, np.nan), forecasts[:, step - 1]])[:n]
+        if alphas is None:
+            return pred
+        return pred, pred[:, None] + self._resid_quantiles([step], np.atleast_1d(alphas))

@@ -141,3 +141,17 @@ class AutoExponentialSmoothing:
         if self.best_ is None:
             raise ValueError("Model is not fitted yet; call .fit(y) first")
         return self.best_.predict_interval(coverage)
+
+    def predict_quantiles(self, alphas: float | Sequence[float]) -> np.ndarray:
+        """Delegate to the winning candidate's predict_quantiles()."""
+        if self.best_ is None:
+            raise ValueError("Model is not fitted yet; call .fit(y) first")
+        return self.best_.predict_quantiles(alphas)
+
+    def predict_in_sample(
+        self, step: int = 1, alphas: float | Sequence[float] | None = None
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        """Delegate to the winning candidate's predict_in_sample()."""
+        if self.best_ is None:
+            raise ValueError("Model is not fitted yet; call .fit(y) first")
+        return self.best_.predict_in_sample(step, alphas)

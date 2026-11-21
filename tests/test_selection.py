@@ -106,6 +106,20 @@ def test_auto_exponential_smoothing_predict_and_predict_interval_delegate():
     np.testing.assert_allclose(upper, best_upper)
 
 
+def test_auto_exponential_smoothing_quantiles_and_in_sample_delegate():
+    y = 3.0 + 2.0 * np.arange(40)
+    model = AutoExponentialSmoothing(h=3, n_splits=2, n_starts=5).fit(y)
+    assert model.best_ is not None
+    np.testing.assert_allclose(
+        model.predict_quantiles([0.1, 0.9]), model.best_.predict_quantiles([0.1, 0.9])
+    )
+    np.testing.assert_allclose(model.predict_in_sample(), model.best_.predict_in_sample())
+    pred, q = model.predict_in_sample(2, [0.1, 0.9])
+    best_pred, best_q = model.best_.predict_in_sample(2, [0.1, 0.9])
+    np.testing.assert_allclose(pred, best_pred)
+    np.testing.assert_allclose(q, best_q)
+
+
 def test_auto_exponential_smoothing_predict_before_fit_raises():
     model = AutoExponentialSmoothing(h=3)
     with pytest.raises(ValueError, match="not fitted"):
