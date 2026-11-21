@@ -29,6 +29,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       MULTI_ETS_EXTENSION: required
+      UV_NO_GROUP: sktime  # core suite runs sktime-free; tests/test_sktime.py skips
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -44,6 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MULTI_ETS_EXTENSION: skip
+      UV_NO_GROUP: sktime
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -52,3 +54,14 @@ jobs:
       - run: uv sync --group dev
       - run: uv run python -c "import multi_ets.holt as h; assert not h._HOLT_HOT_AVAILABLE"
       - run: uv run pytest tests/ -q
+
+  test-sktime:
+    # The sktime adapter, with the sktime dependency group (a default group) installed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run pytest tests/test_sktime.py -q

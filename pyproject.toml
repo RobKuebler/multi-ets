@@ -29,6 +29,10 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+# 0.39 is the first sktime with the capability:exogenous tag the adapter sets.
+sktime = ["sktime>=0.39"]
+
 [project.urls]
 Repository = "https://github.com/RobKuebler/multi-ets"
 Issues = "https://github.com/RobKuebler/multi-ets/issues"
@@ -46,6 +50,11 @@ benchmark = [
     "statsforecast>=2.0",
     "matplotlib>=3.8",
     "pandas>=2.0",
+]
+# Own group (not dev) so the core CI matrix runs without sktime; default-groups
+# below still installs it locally. Mirrors the `sktime` extra.
+sktime = [
+    "sktime>=0.39",
 ]
 
 [build-system]
@@ -66,6 +75,7 @@ multi_ets = ["py.typed"]
 multi_ets = ["*.pyx", "*.c"]
 
 [tool.uv]
+default-groups = ["dev", "sktime"]
 # Rebuild the editable install when the Cython source or build script changes.
 cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { file = "src/**/*.pyx" }]
 

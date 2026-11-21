@@ -143,6 +143,53 @@ an *innovations*-based (MLE) auto-selector -- a structurally different fitting p
 CONTEXT.md's "Innovations ETS" glossary entry) -- and this repo's own benchmarks compare against
 it directly.
 
+### sktime integration
+
+```bash
+pip install "multi-ets[sktime]"
+```
+
+`MultiETSForecaster` and `AutoMultiETSForecaster` wrap the two models as sktime forecasters, with
+the same hyperparameters minus `h` (`seasonal_period` is sktime's `sp`). The `fh` passed to
+`fit` sets the training horizon: its positive steps are the list `h`, so `fh=[1, 2, 3, 7, 8, 9]`
+trains on just those steps. In-sample `fh` points (step <= 0) are `insample_step`-ahead
+predictions (default 1). Multivariate or hierarchical `y` is fit one series at a time by sktime.
+
+```python
+from sktime.datasets import load_airline
+from sktime.forecasting.model_evaluation import evaluate
+from sktime.split import ExpandingWindowSplitter
+
+from multi_ets.integrations.sktime import MultiETSForecaster
+
+y = load_airline()  # monthly airline passengers, PeriodIndex
+
+# Train on, and forecast, the next quarter plus months 7-9 only.
+forecaster = MultiETSForecaster(
+    trend="damped", seasonal_period=12, seasonal_type="multiplicative"
+)
+forecaster.fit(y, fh=[1, 2, 3, 7, 8, 9])
+y_pred = forecaster.predict()
+intervals = forecaster.predict_interval(coverage=0.9)
+
+# Rolling-origin backtest, like any other sktime forecaster.
+cv = ExpandingWindowSplitter(initial_window=96, step_length=12, fh=[1, 2, 3, 7, 8, 9])
+results = evaluate(forecaster, cv=cv, y=y)
+print(results[["test_MeanAbsolutePercentageError", "fit_time"]].mean())
+```
+
+For calibrated intervals, wrap it in `ConformalIntervals`. Its refits forecast every point after
+the training window, so pick an `initial_window` above half the series, and give `y` a
+`PeriodIndex` or `DatetimeIndex` (with a plain integer index sktime reads those points as relative
+steps):
+
+```python
+from sktime.forecasting.conformal import ConformalIntervals
+
+conformal = ConformalIntervals(MultiETSForecaster(trend="add"), initial_window=len(y) * 2 // 3)
+intervals = conformal.fit(y, fh=[1, 2, 3]).predict_interval(coverage=0.9)
+```
+
 ### Loss
 
 All models accept a `loss` kwarg: `"mse"` (default), `"mae"`, `"huber"` (+ `delta`), `"pinball"` (+
