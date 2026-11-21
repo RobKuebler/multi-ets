@@ -1,6 +1,6 @@
 [project]
 name = "multi-ets"
-version = "0.1.0"
+version = "0.2.0"
 description = "Exponential smoothing (SES, Holt, Holt-Winters) fit by joint multi-step-ahead loss instead of one-step-ahead residuals."
 readme = "README.md"
 authors = [
