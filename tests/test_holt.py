@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 from scipy.optimize import approx_fprime
@@ -710,7 +712,9 @@ def test_predict_interval_contains_point_forecast():
     model = ExponentialSmoothing(trend="add", h=5, loss="mse").fit(y)
     lower, upper = model.predict_interval(coverage=0.9)
     point = model.predict()
-    assert np.all(lower <= point) and np.all(point <= upper)
+    # Residuals are ~0 here; the interval is no longer centered on point (it includes the
+    # residuals' mean), so allow for float noise around a zero-width interval.
+    assert np.all(lower <= point + 1e-6) and np.all(point <= upper + 1e-6)
 
 
 def test_predict_interval_widens_with_coverage():
@@ -740,7 +744,9 @@ def test_predict_interval_works_for_seasonal_model():
     model = ExponentialSmoothing(trend="add", h=h, seasonal_period=m, loss="mse", n_starts=8).fit(y)
     lower, upper = model.predict_interval(coverage=0.9)
     point = model.predict()
-    assert np.all(lower <= point) and np.all(point <= upper)
+    # Noise-free data: ~0 residuals, so a ~zero-width interval at the point up to float noise.
+    np.testing.assert_allclose(lower, point, atol=1e-5)
+    np.testing.assert_allclose(upper, point, atol=1e-5)
 
 
 def test_predict_interval_works_for_ses():
@@ -748,7 +754,10 @@ def test_predict_interval_works_for_ses():
     model = ExponentialSmoothing(h=4, loss="mse").fit(y)
     lower, upper = model.predict_interval(coverage=0.9)
     point = model.predict()
-    assert np.all(lower <= point) and np.all(point <= upper)
+    # A flat forecast of a rising series under-forecasts every in-sample step, and the
+    # residual-based interval carries that bias: it is skewed upward, more so with k.
+    assert np.all(point < upper) and np.all(lower < upper)
+    assert np.all(np.diff(lower) > 0) and np.all(np.diff(upper) > 0)
 
 
 def test_attribute_set_after_construction_is_honored_at_fit():
@@ -1265,7 +1274,8 @@ def test_holt_winters_predict_interval_correct_with_nan_in_fitted_series():
     point = model.predict()
     lower, upper = model.predict_interval(coverage=0.9)
     assert np.all(np.isfinite(lower)) and np.all(np.isfinite(upper))
-    assert np.all(lower <= point) and np.all(point <= upper)
+    np.testing.assert_allclose(lower, point, atol=1e-5)  # noise-free: ~zero-width interval
+    np.testing.assert_allclose(upper, point, atol=1e-5)
 
 
 def test_heuristic_seasonal_init_skips_interior_nan():
@@ -1364,3 +1374,133 @@ def test_list_h_custom_loss_sees_only_listed_steps():
 def test_invalid_list_h_raises(h):
     with pytest.raises(ValueError, match="h must be"):
         ExponentialSmoothing(h=h)
+
+
+# --- Empirical residual-quantile intervals (docs/adr/0006) ---
+
+
+def _local_level(seed: int, n: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return 10.0 + np.cumsum(rng.normal(0, 0.5, n)) + rng.normal(0, 1.0, n)
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_predict_interval_coverage_near_nominal(compiled: bool, monkeypatch: pytest.MonkeyPatch):
+    if not compiled:
+        monkeypatch.setattr(holt_module, "_holt_hot", None)
+    h, hits = 3, []
+    for seed in range(40):
+        y = _local_level(seed, 150 + h)
+        model = ExponentialSmoothing(h=h, n_starts=2).fit(y[:-h])
+        lower, upper = model.predict_interval(coverage=0.8)
+        hits.append((lower <= y[-h:]) & (y[-h:] <= upper))
+    assert 0.65 <= np.mean(hits) <= 0.92
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_biased_model_gives_asymmetric_interval(compiled: bool, monkeypatch: pytest.MonkeyPatch):
+    if not compiled:
+        monkeypatch.setattr(holt_module, "_holt_hot", None)
+    rng = np.random.default_rng(12)
+    y = 10.0 + rng.normal(0, 1.0, 200)
+    # tau=0.1 pinball: the point forecast sits near the 10% quantile, under-forecasting.
+    model = ExponentialSmoothing(h=3, loss="pinball", tau=0.1, n_starts=3).fit(y)
+    point = model.predict()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # 200 points: no Gaussian fallback
+        lower, upper = model.predict_interval(coverage=0.8)
+    assert np.all(upper - point > 2 * (point - lower))
+
+
+def test_short_series_falls_back_to_gaussian_with_one_warning():
+    y = _local_level(0, 20)
+    model = ExponentialSmoothing(h=3).fit(y)
+    with pytest.warns(UserWarning, match="Gaussian approximation") as record:
+        result = model.predict_interval(coverage=[0.5, 0.9])
+    assert len(record) == 1
+    assert isinstance(result, dict)
+    lower, upper = result[0.9]
+    assert np.all(np.isfinite(lower)) and np.all(lower < upper)
+
+
+def test_step_longer_than_series_gives_nan_with_warning():
+    y = _local_level(0, 10)
+    model = ExponentialSmoothing(h=1).fit(y)
+    model.h = 12  # extrapolate past the training horizon (see docs/adr/0003)
+    with pytest.warns(UserWarning, match="NaN where there are none"):
+        lower, upper = model.predict_quantiles([0.05, 0.95]).T
+    assert np.all(np.isfinite(lower[:10])) and np.all(np.isnan(lower[10:]))
+    assert np.all(np.isnan(upper[10:]))
+
+
+def test_predict_quantiles_shape_and_monotone():
+    y = _local_level(1, 120)
+    model = ExponentialSmoothing(h=4, trend="damped").fit(y)
+    q = model.predict_quantiles([0.05, 0.25, 0.5, 0.75, 0.95])
+    assert q.shape == (4, 5)
+    assert np.all(np.diff(q, axis=1) >= 0)
+    assert model.predict_quantiles(0.5).shape == (4, 1)
+    lower, upper = model.predict_interval(coverage=0.5)
+    np.testing.assert_allclose(lower, q[:, 1])
+    np.testing.assert_allclose(upper, q[:, 3])
+
+
+def test_list_h_quantiles_match_rows_of_full_horizon():
+    y = _local_level(2, 120)
+    model = ExponentialSmoothing(h=[1, 3, 5], trend="add").fit(y)
+    q = model.predict_quantiles([0.1, 0.9])
+    assert q.shape == (3, 2)
+    full = ExponentialSmoothing(h=5, trend="add")
+    full.params_, full._y = model.params_, model._y
+    np.testing.assert_allclose(q, full.predict_quantiles([0.1, 0.9])[[0, 2, 4]])
+    lower, _ = model.predict_interval(coverage=0.8)
+    np.testing.assert_allclose(lower, q[:, 0])
+
+
+@pytest.mark.parametrize(
+    ("trend", "seasonal_period", "seasonal_type"),
+    [(None, None, "additive"), ("damped", None, "additive"), ("add", 4, "multiplicative")],
+)
+def test_predict_in_sample_step1_matches_predict_on_prefix(
+    trend: str | None, seasonal_period: int | None, seasonal_type: str
+):
+    t = np.arange(60)
+    y = 20.0 + 0.3 * t + np.tile([3.0, -1.0, -2.5, 0.5], 15) + _local_level(3, 60) - 10.0
+    model = ExponentialSmoothing(
+        h=2, trend=trend, seasonal_period=seasonal_period, seasonal_type=seasonal_type
+    ).fit(y)
+    pred = model.predict_in_sample()
+    assert pred.shape == y.shape and np.all(np.isfinite(pred))
+    prefix = ExponentialSmoothing(
+        h=3, trend=trend, seasonal_period=seasonal_period, seasonal_type=seasonal_type
+    )
+    prefix.params_ = model.params_
+    for cut in (0, 1, 17, 59):
+        prefix._y = y[:cut]
+        assert pred[cut] == pytest.approx(prefix.predict()[0])
+    # step=3: forecast of y[t] from origin t - 2, NaN where there is none.
+    pred3 = model.predict_in_sample(step=3)
+    assert np.all(np.isnan(pred3[:2])) and np.all(np.isfinite(pred3[2:]))
+    for cut in (0, 17, 57):
+        prefix._y = y[:cut]
+        assert pred3[cut + 2] == pytest.approx(prefix.predict()[2])
+
+
+def test_predict_in_sample_quantiles():
+    y = _local_level(4, 100)
+    model = ExponentialSmoothing(h=2).fit(y)
+    pred, q = model.predict_in_sample(step=2, alphas=[0.1, 0.9])
+    assert q.shape == (100, 2)
+    assert np.isnan(q[0]).all() and np.all(q[1:, 0] < pred[1:]) and np.all(pred[1:] < q[1:, 1])
+    # Same step-2 residual quantile offsets as an out-of-sample step-2 forecast.
+    offsets = model.predict_quantiles([0.1, 0.9])[1] - model.predict()[1]
+    np.testing.assert_allclose(q[1:] - pred[1:, None], np.broadcast_to(offsets, (99, 2)))
+
+
+def test_predict_in_sample_rejects_bad_step_and_unfitted():
+    with pytest.raises(ValueError, match="not fitted"):
+        ExponentialSmoothing(h=2).predict_in_sample()
+    model = ExponentialSmoothing(h=2).fit(_local_level(0, 30))
+    with pytest.raises(ValueError, match="positive"):
+        model.predict_in_sample(step=0)
+    assert np.isnan(model.predict_in_sample(step=40)).all()
